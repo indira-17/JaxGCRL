@@ -261,10 +261,10 @@ def make_sac_networks_with_goal_rep(
     activation: networks.ActivationFn = linen.relu,
     layer_norm: bool = False,
 ) -> SACNetworks:
-    """Make SAC networks with goal_rep as actor input. Critic uses full obs."""
-    obs_size = state_dim + goal_dim
+    """Make SAC networks with goal_rep as both actor and critic input."""
     parametric_action_distribution = distribution.NormalTanhDistribution(event_size=action_size)
-    actor_obs_size = state_dim + rep_dim
+    actor_obs_size = state_dim + rep_dim   # policy input: [s, φ(s,g)]
+    raw_obs_size = state_dim + goal_dim    # Q input: raw [s, g]
     policy_network = make_policy_network(
         parametric_action_distribution.param_size,
         actor_obs_size,
@@ -274,7 +274,7 @@ def make_sac_networks_with_goal_rep(
         layer_norm=layer_norm,
     )
     q_network = make_q_network(
-        obs_size,
+        raw_obs_size,
         action_size,
         preprocess_observations_fn=preprocess_observations_fn,
         hidden_layer_sizes=hidden_layer_sizes,

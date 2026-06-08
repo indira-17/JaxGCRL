@@ -201,9 +201,14 @@ class MetricsRecorder:
 
         self.max_x, self.min_x = total_env_steps * 1.1, 0
 
+        self.trigger_sync = None
         if mode == "offline":
             wandb_osh.set_log_level("ERROR")
-        self.trigger_sync = TriggerWandbSyncHook()
+            communication_dir = os.environ.get("WANDB_OSH_COMM_DIR")
+            if communication_dir is None:
+                cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+                communication_dir = os.path.join(cache_root, "wandb_osh_command_dir")
+            self.trigger_sync = TriggerWandbSyncHook(communication_dir=communication_dir)
 
     def record(self, num_steps, metrics):
         self.times.append(datetime.now())
@@ -224,7 +229,7 @@ class MetricsRecorder:
         data_to_log["step"] = self.x_data[-1]
         wandb.log(data_to_log, step=self.x_data[-1])
 
-        if self.mode == "offline":
+        if self.mode == "offline" and self.trigger_sync is not None:
             self.trigger_sync()
 
     def plot_progress(self):

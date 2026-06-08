@@ -22,9 +22,15 @@ import logging
 import time
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Tuple, Union
 
+import flax
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
+import wandb
 from brax import base, envs
 from brax.io import model
 from brax.training import gradients, pmap, types
@@ -34,6 +40,7 @@ from brax.training.agents.sac import losses as sac_losses
 from brax.training.replay_buffers_test import jit_wrap
 from brax.training.types import Params, Policy, PRNGKey
 from flax.struct import dataclass
+from flax.training import checkpoints
 
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import Evaluator
@@ -158,7 +165,26 @@ def _make_losses_with_goal_rep(
         action = parametric_action_distribution.sample_no_postprocessing(dist_params, key)
         log_prob = parametric_action_distribution.log_prob(dist_params, action)
         alpha = jnp.exp(log_alpha)
-        return jnp.mean(alpha * jax.lax.stop_gradient(-log_prob - target_entropy))
+        # Adaptive H_target: add sg(L_geom-NCE) so alpha rises when rep is uncertain
+        effective_target = target_entropy
+        if use_info_nce:
+            ae_params = jax.lax.stop_gradient(actor_params["actions_encoder"])
+            infonce = transitions.extras["infonce"]
+            h = goal_rep_network.apply(goal_rep_params, infonce["state_t"], infonce["goal_tk"])
+            e = actions_encoder_network.apply(ae_params, infonce["actions_list"])
+            # Normalized dot-product matrix — same computation as inside _info_nce_loss
+            h_n = h / optax.safe_norm(h, min_norm=1e-6, ord=2, axis=-1, keepdims=True)
+            e_n = e / optax.safe_norm(e, min_norm=1e-6, ord=2, axis=-1, keepdims=True)
+            sim = jnp.matmul(h_n, e_n.T) / nce_temperature  # (B, B)
+            diag = jnp.diag(sim)
+            # NCE value to learn p(s,g)
+            l_nce = (jnp.mean(-diag + jax.nn.logsumexp(sim, axis=-1))
+                     + jnp.mean(-diag + jax.nn.logsumexp(sim, axis=0)))
+            p = jnp.clip(jax.nn.sigmoid(1.0 - l_nce), 0.03, 0.2)
+            # E[K] = (1-p)/p for Geom(p), clipped to [0, |H_target|] so effective_target stays <= 0 and alpha cannot diverge
+            bonus = jnp.clip((1.0 - p) / p, 0.0, -target_entropy)
+            effective_target = target_entropy + jax.lax.stop_gradient(bonus)
+        return jnp.mean(alpha * jax.lax.stop_gradient(-log_prob - effective_target))
 
     def critic_loss(
         q_params,
@@ -169,10 +195,10 @@ def _make_losses_with_goal_rep(
         transitions,
         key: PRNGKey,
     ):
-        sg = jax.lax.stop_gradient
-        goal_rep_params = sg(actor_params["goal_rep"])
-        policy_params = sg(actor_params["policy"])
+        goal_rep_params = jax.lax.stop_gradient(actor_params["goal_rep"])
+        policy_params = jax.lax.stop_gradient(actor_params["policy"])
 
+        # Q uses raw [s,g]; policy uses rep input [s,phi] only for action sampling
         q_old_action = q_network.apply(
             normalizer_params, q_params, transitions.observation, transitions.action
         )
@@ -201,7 +227,7 @@ def _make_losses_with_goal_rep(
         transitions,
         key: PRNGKey,
     ):
-        goal_rep_params = actor_params["goal_rep"]
+        goal_rep_params = actor_params["goal_rep"]  # trainable: finetuned via SAC actor + NCE loss
         policy_params = actor_params["policy"]
 
         actor_input = _goal_rep_actor_input(goal_rep_params, transitions.observation)
@@ -209,6 +235,7 @@ def _make_losses_with_goal_rep(
         action = parametric_action_distribution.sample_no_postprocessing(dist_params, key)
         log_prob = parametric_action_distribution.log_prob(dist_params, action)
         action = parametric_action_distribution.postprocess(action)
+        # Q uses raw obs [s,g], not rep space
         q_action = q_network.apply(
             normalizer_params, q_params, transitions.observation, action
         )
@@ -348,6 +375,27 @@ def _unpmap(v):
     return jax.tree_util.tree_map(lambda x: x[0], v)
 
 
+def _load_goal_rep_from_rep_learn_checkpoint(path: str, goal_rep_params, actions_encoder_params=None):
+    """Load GoalRep (and optionally ActionsEncoder) params from a rep_learn checkpoint.
+
+    rep_learn saves RepLearnAgent params with keys 'GoalRep_0' and 'ActionsEncoder_0'.
+    SAC stores goal_rep_params as the full Flax variable dict {'params': ...}.
+    """
+    ckpt = checkpoints.restore_checkpoint(ckpt_dir=path, target=None, prefix="rep_params_")
+    if ckpt is None:
+        raise FileNotFoundError(
+            f"No rep_learn checkpoint found at '{path}' with prefix 'rep_params_'. "
+            "Run rep_learn training first or check the path."
+        )
+    loaded_gr = flax.serialization.from_state_dict(goal_rep_params, {'params': ckpt['GoalRep_0']})
+    loaded_ae = None
+    if actions_encoder_params is not None and 'ActionsEncoder_0' in ckpt:
+        loaded_ae = flax.serialization.from_state_dict(
+            actions_encoder_params, {'params': ckpt['ActionsEncoder_0']}
+        )
+    return loaded_gr, loaded_ae
+
+
 def _init_training_state(
     key: PRNGKey,
     obs_size: int,
@@ -361,6 +409,7 @@ def _init_training_state(
     action_size: int = 0,
     nce_k_step: int = 0,
     use_info_nce: bool = False,
+    pretrained_goal_rep_path: str = "",
 ) -> TrainingState:
     """Inits the training state and replicates it over devices."""
     key_policy, key_q, key_gr, key_ae = jax.random.split(key, 4)
@@ -380,10 +429,22 @@ def _init_training_state(
         dummy_goal = jnp.zeros((1, goal_dim))
         goal_rep_params = sac_network.goal_rep_network.init(key_gr, dummy_state, dummy_goal)
 
+        if pretrained_goal_rep_path:
+            logging.info("Loading pretrained goal_rep from: %s", pretrained_goal_rep_path)
+            goal_rep_params, _ = _load_goal_rep_from_rep_learn_checkpoint(
+                pretrained_goal_rep_path, goal_rep_params
+            )
+
         actor_params = {"policy": policy_params, "goal_rep": goal_rep_params}
         if use_info_nce and sac_network.actions_encoder_network is not None:
             dummy_actions_flat = jnp.zeros((1, nce_k_step * action_size))
             actions_encoder_params = sac_network.actions_encoder_network.init(key_ae, dummy_actions_flat)
+            if pretrained_goal_rep_path:
+                _, loaded_ae = _load_goal_rep_from_rep_learn_checkpoint(
+                    pretrained_goal_rep_path, goal_rep_params, actions_encoder_params
+                )
+                if loaded_ae is not None:
+                    actions_encoder_params = loaded_ae
             actor_params["actions_encoder"] = actions_encoder_params
 
         policy_optimizer_state = policy_optimizer.init(actor_params)
@@ -440,6 +501,11 @@ class SAC:
     nce_k_step: int = 25
     nce_temperature: float = 0.1
     infonce_weight: float = 0.5
+    # Pretrained representation (used only for initialisation; rep is always trained end-to-end)
+    pretrained_goal_rep_path: str = ""
+    # State coverage visualization
+    log_state_coverage: bool = False
+    state_coverage_xy_dims: Tuple[int, int] = (0, 1)
 
     def train_fn(
         self,
@@ -678,11 +744,25 @@ class SAC:
                 q_params,
             )
 
+            # Policy uses rep input [s,phi]; Q uses raw obs [s,g]
+            _obs_state = transitions.observation[..., :state_dim]
+            _obs_goal = transitions.observation[..., state_dim : state_dim + goal_dim]
+            _obs_phi = sac_network.goal_rep_network.apply(new_goal_rep_params, _obs_state, _obs_goal)
+            _obs_rep = jnp.concatenate([_obs_state, _obs_phi], axis=-1)
+            # q_rep_actor_mean: Q(raw [s,g], π([s,φ])) — Q value of current policy's actions
+            _actor_dist = sac_network.policy_network.apply(
+                training_state.normalizer_params, new_actor_params["policy"], _obs_rep
+            )
+            _actor_actions = sac_network.parametric_action_distribution.mode(_actor_dist)
+            rep_actor_q = sac_network.q_network.apply(
+                training_state.normalizer_params, q_params, transitions.observation, _actor_actions
+            )
             metrics = {
                 "critic_loss": critic_loss_val,
                 "actor_loss": actor_loss_val,
                 "alpha_loss": alpha_loss_val,
                 "alpha": jnp.exp(alpha_params),
+                "q_rep_actor_mean": jnp.mean(rep_actor_q),
             }
             if _use_nce:
                 infonce = transitions.extras["infonce"]
@@ -722,7 +802,7 @@ class SAC:
         def get_experience(
             normalizer_params: running_statistics.RunningStatisticsState,
             policy_params,
-            env_state: Union[envs.State, envs_v1.State],
+            env_state: envs.State,
             buffer_state: ReplayBufferState,
             key: PRNGKey,
         ):
@@ -918,6 +998,7 @@ class SAC:
             action_size=action_size,
             nce_k_step=self.nce_k_step,
             use_info_nce=self.use_info_nce,
+            pretrained_goal_rep_path=self.pretrained_goal_rep_path,
         )
         del global_key
 
@@ -982,6 +1063,24 @@ class SAC:
         assert replay_size >= self.min_replay_size
         training_walltime = time.time() - t
 
+        # State coverage tracking
+        # If the env exposes goal_indices we use its first two entries (the agent's x,y in obs)
+        _raw_goal_indices = getattr(unwrapped_env, "goal_indices", None)
+        if self.log_state_coverage and _raw_goal_indices is not None and len(_raw_goal_indices) >= 2:
+            _cov_xy0, _cov_xy1 = int(_raw_goal_indices[0]), int(_raw_goal_indices[1])
+            logging.info(
+                "State coverage: auto-detected XY dims from env.goal_indices -> (%d, %d)",
+                _cov_xy0, _cov_xy1,
+            )
+        else:
+            _cov_xy0, _cov_xy1 = self.state_coverage_xy_dims
+            if self.log_state_coverage:
+                logging.info(
+                    "State coverage: using configured state_coverage_xy_dims -> (%d, %d)",
+                    _cov_xy0, _cov_xy1,
+                )
+        _coverage_history = [] if self.log_state_coverage else None
+
         current_step = 0
         for eval_epoch_num in range(num_evals_after_init):
             logging.info("step %s", current_step)
@@ -993,6 +1092,12 @@ class SAC:
                 training_state, env_state, buffer_state, epoch_keys
             )
             current_step = int(_unpmap(training_state.env_steps))
+
+            # accumulate current env positions
+            if _coverage_history is not None:
+                # env_state.obs shape: (local_devices, num_envs_per_device, obs_size)
+                obs_np = np.array(jax.device_get(env_state.obs)).reshape(-1, obs_size)
+                _coverage_history.append(obs_np[:, [_cov_xy0, _cov_xy1]])
 
             # Eval and logging
             if process_id == 0:
@@ -1006,6 +1111,34 @@ class SAC:
                     training_metrics,
                 )
                 do_render = (eval_epoch_num % config.visualization_interval) == 0
+                if _coverage_history:
+                    all_pos = np.concatenate(_coverage_history, axis=0)
+                    bins = 50
+                    h, xedges, yedges = np.histogram2d(
+                        all_pos[:, 0], all_pos[:, 1], bins=bins
+                    )
+                    # Coverage entropy: higher = more uniform exploration
+                    p = h / h.sum()
+                    p_nz = p[p > 0]
+                    coverage_entropy = float(-np.sum(p_nz * np.log(p_nz)))
+                    occupied_cells = int(np.sum(h > 0))
+                    # Log scalar metrics every eval epoch (not just at render intervals)
+                    wandb.log({
+                        "state_coverage_entropy": coverage_entropy,
+                        "state_coverage_cells": occupied_cells,
+                    }, step=current_step)
+                    if do_render:
+                        fig, ax = plt.subplots(figsize=(6, 6))
+                        im = ax.imshow(
+                            h.T, origin="lower", aspect="auto", cmap="hot",
+                            extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                        )
+                        plt.colorbar(im, ax=ax, label="visit count")
+                        ax.set_title(f"State Coverage (step {current_step}, H={coverage_entropy:.2f}, cells={occupied_cells}/{bins*bins})")
+                        ax.set_xlabel(f"dim {_cov_xy0}")
+                        ax.set_ylabel(f"dim {_cov_xy1}")
+                        wandb.log({"state_coverage": wandb.Image(fig)}, step=current_step)
+                        plt.close(fig)
                 progress_fn(
                     current_step,
                     metrics,

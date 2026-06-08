@@ -3,6 +3,9 @@ import os
 import pickle
 import pprint
 
+# Redirect matplotlib config/cache to /tmp to avoid NFS quota errors on clusters.
+os.environ.setdefault("MPLCONFIGDIR", "/tmp")
+
 import tyro
 from brax.io import model
 
@@ -91,6 +94,10 @@ def main(config: Config):
             "training/alpha_loss",
             "training/alpha",
             "training/nce_loss",
+            "training/q_raw_mean",
+            "training/q_rep_actor_mean",
+            "state_coverage_entropy",
+            "state_coverage_cells",
         ],
         "CRL": [
             "training/actor_loss",

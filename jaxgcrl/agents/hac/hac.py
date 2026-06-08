@@ -12,7 +12,6 @@ from brax.training.acme import running_statistics
 from flax import nnx
 from flax.struct import dataclass
 
-from jaxgcrl.agents.hac.networks import make_networks_and_buffers
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 
 Metrics = types.Metrics
@@ -71,6 +70,7 @@ def train_fn(
     randomization_fn: Optional[Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]] = None,
     progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
 ):
+    from jaxgcrl.agents.hac.networks import make_networks_and_buffers
 
     if self.min_replay_size >= config.total_env_steps:
         raise ValueError("No training will happen because min_replay_size >= total_env_steps")

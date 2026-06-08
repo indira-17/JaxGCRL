@@ -1,0 +1,39 @@
+dataset:
+  source: ogbench
+  name: antmaze-medium-navigate-v0
+  dir: /scratch/cluster/idutta/ogbench_datasets
+  compact_dataset: false
+  download_first: true
+gc_sampling:
+  discount: 0.99
+  geom_sample: true
+  p_trajgoal: 0.9
+  p_randomgoal: 0.1
+rep_learn:
+  seed: 0
+  use_goal_rep: true
+  rep_dim: 64
+  hidden_sizes:
+  - 256
+  - 256
+  batch_size: 1024
+  val_num_batches: 8
+  eval_interval: 100
+  epochs: 100000
+  learning_rate: 0.0003
+  temperature: 0.1
+  nce_min_norm: 1.0e-06
+  nce_norm_ord: 2
+  nce_norm_axis: -1
+  nce_norm_keepdims: true
+  init_best_loss: 'inf'
+  checkpoint_prefix: rep_params_
+  checkpoint_overwrite: true
+wandb:
+  project: jaxgcrl-rep-learn
+  mode: online
+logging:
+  wandb_loss_key: train/loss
+  wandb_val_loss_key: val/loss
+  start_message: Starting offline representation training...
+  step_message_template: 'Step {step} | Train Loss: {loss:.4f} | Val Loss: {val_loss}'
