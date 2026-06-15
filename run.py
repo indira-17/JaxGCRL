@@ -105,6 +105,8 @@ def main(config: Config):
             "training/alpha_loss",
             "training/critic_loss",
             "training/entropy",
+            "state_coverage_entropy",
+            "state_coverage_cells",
         ],
         "HIQL": [
             "training/total_loss",
@@ -122,6 +124,8 @@ def main(config: Config):
             "training/high_actor/bc_log_prob",
             "training/high_actor/mse",
             "training/high_actor/std",
+            "state_coverage_entropy",
+            "state_coverage_cells",
         ],
         "HSAC": [
             "training/total_loss",
@@ -140,6 +144,64 @@ def main(config: Config):
             "training/high_actor/std",
             "training/alpha/low",
             "training/alpha/high",
+        ],
+        "HCRL": [
+            # Original CRL losses.
+            "training/actor_loss",
+            "training/log_alpha",
+            "training/alpha_loss",
+            "training/critic_loss",
+            "training/entropy",
+
+            # Critic diagnostics.
+            "training/categorical_accuracy",
+            "training/logits_pos",
+            "training/logits_neg",
+            "training/logsumexp",
+
+            # High actor diagnostics.
+            # These are zero/skipped when flat_policy=True.
+            "training/high_actor_loss",
+            "training/high_actor_log_prob",
+            "training/high_actor_mse",
+            "training/high_actor_std",
+
+            # Replay/training diagnostics.
+            "training/buffer_current_size",
+            "training/gradient_steps",
+
+            # Optional state coverage.
+            "state_coverage_entropy",
+            "state_coverage_cells",
+        ],
+        "HCARL": [
+            # Original CRL losses.
+            "training/actor_loss",
+            "training/log_alpha",
+            "training/alpha_loss",
+            "training/critic_loss",
+            "training/entropy",
+
+            # Critic diagnostics.
+            "training/categorical_accuracy",
+            "training/logits_pos",
+            "training/logits_neg",
+            "training/logsumexp",
+
+            # High actor diagnostics.
+            # These are zero/skipped when flat_policy=True.
+            "training/high_actor_loss",
+            "training/high_actor_log_prob",
+            "training/high_actor_mse",
+            "training/high_actor_std",
+
+            # Replay/training diagnostics.
+            "training/buffer_current_size",
+            "training/gradient_steps",
+
+            # Optional state coverage.
+            "state_coverage_entropy",
+            "state_coverage_cells",
         ],
     }
 

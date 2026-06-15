@@ -2,12 +2,12 @@ from typing import Literal, Optional, Union
 
 from flax.struct import dataclass
 
-from jaxgcrl.agents import CRL, HAC, HIQL, HSAC, PPO, SAC, TD3
+from jaxgcrl.agents import CRL, HAC, HIQL, HSAC, PPO, SAC, TD3, HCRL, HCARL
 
 from .env import legal_envs
 
 # agent configurations
-AgentConfig = Union[CRL, HAC, HIQL, HSAC, PPO, SAC, TD3]
+AgentConfig = Union[CRL, HAC, HIQL, HSAC, PPO, SAC, TD3, HCRL, HCARL]
 
 
 @dataclass

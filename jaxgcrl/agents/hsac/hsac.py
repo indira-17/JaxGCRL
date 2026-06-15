@@ -12,10 +12,14 @@ import time
 from typing import Any, Callable, NamedTuple, Optional, Tuple, Union
 
 import flax.linen as nn
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import wandb
 from brax import base, envs
 from brax.training import types
 from brax.v1 import envs as envs_v1
@@ -106,6 +110,10 @@ class HSAC:
     min_replay_size: int = 1000
     unroll_length: int = 62
 
+    # State coverage visualization
+    log_state_coverage: bool = False
+    state_coverage_xy_dims: Tuple[int, int] = (0, 1)
+
     def train_fn(
         self,
         config,
@@ -155,6 +163,24 @@ class HSAC:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size
+
+        # State coverage tracking
+        # If the env exposes goal_indices we use its first two entries (the agent's x,y in obs)
+        _raw_goal_indices = getattr(unwrapped_env, "goal_indices", None)
+        if self.log_state_coverage and _raw_goal_indices is not None and len(_raw_goal_indices) >= 2:
+            _cov_xy0, _cov_xy1 = int(_raw_goal_indices[0]), int(_raw_goal_indices[1])
+            logging.info(
+                "State coverage: auto-detected XY dims from env.goal_indices -> (%d, %d)",
+                _cov_xy0, _cov_xy1,
+            )
+        else:
+            _cov_xy0, _cov_xy1 = self.state_coverage_xy_dims
+            if self.log_state_coverage:
+                logging.info(
+                    "State coverage: using configured state_coverage_xy_dims -> (%d, %d)",
+                    _cov_xy0, _cov_xy1,
+                )
+        _coverage_history = [] if self.log_state_coverage else None
 
         # ===== Network definitions =====
         goal_rep_module = GoalRep(
@@ -577,6 +603,12 @@ class HSAC:
                 training_state, env_state, buffer_state, epoch_key
             )
 
+            # accumulate current env positions
+            if _coverage_history is not None:
+                # env_state.obs shape may be sharded/device-stacked depending on wrap/pmap settings
+                obs_np = np.array(jax.device_get(env_state.obs)).reshape(-1, obs_size)
+                _coverage_history.append(obs_np[:, [_cov_xy0, _cov_xy1]])
+
             metrics = jax.tree_util.tree_map(jnp.mean, metrics)
             metrics = jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
 
@@ -610,6 +642,35 @@ class HSAC:
                     return action, {}
                 return _policy
             make_policy = _make_policy
+
+            if _coverage_history:
+                all_pos = np.concatenate(_coverage_history, axis=0)
+                bins = 50
+                h, xedges, yedges = np.histogram2d(
+                    all_pos[:, 0], all_pos[:, 1], bins=bins
+                )
+
+                # Coverage entropy: higher = more uniform exploration
+                p = h / h.sum()
+                p_nz = p[p > 0]
+                coverage_entropy = float(-np.sum(p_nz * np.log(p_nz)))
+                occupied_cells = int(np.sum(h > 0))
+
+                if do_render:
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    im = ax.imshow(
+                        h.T, origin="lower", aspect="auto", cmap="hot",
+                        extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]],
+                    )
+                    plt.colorbar(im, ax=ax, label="visit count")
+                    ax.set_title(
+                        f"State Coverage (step {current_step}, "
+                        f"H={coverage_entropy:.2f}, cells={occupied_cells}/{bins * bins})"
+                    )
+                    ax.set_xlabel(f"dim {_cov_xy0}")
+                    ax.set_ylabel(f"dim {_cov_xy1}")
+                    wandb.log({"state_coverage": wandb.Image(fig)}, step=current_step)
+                    plt.close(fig)
 
             progress_fn(
                 current_step,

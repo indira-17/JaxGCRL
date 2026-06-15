@@ -18,8 +18,11 @@ parameters:
     min: 0
     max: 100
     distribution: int_uniform
-  env_name:
+  env:
     value: "ant"
+    distribution: constant
+  log_state_coverage:
+    value: true
     distribution: constant
 command:
   - ${env}
