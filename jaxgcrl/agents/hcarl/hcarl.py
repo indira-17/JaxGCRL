@@ -1,20 +1,17 @@
-"""Online HCARL implemented as original CRL plus one high actor.
+"""Online HCARL: CARL representation + HIQL-style value/AWR hierarchy.
 
 Design goal:
-  - flat_policy=True: use the original CRL components and losses.
-  - flat_policy=False: add only a high actor that predicts raw subgoals.
-
-Low-level learning is not copied/reimplemented here. The low actor and critic
-updates are imported from jaxgcrl.agents.crl.losses through .losses. The CRL
-networks Actor, SAEncoder, and Encoder are imported from
-jaxgcrl.agents.crl.networks. This avoids accidental drift from CRL.
+  - CARL learns phi(s, g) using state-goal/action-sequence contrastive loss.
+  - Value learns V(s, phi(s, g)) with an HIQL-style expectile TD loss.
+  - Low actor is AWR/NLL on dataset actions conditioned on phi(s, local_goal).
+  - High actor is AWR/NLL on latent subgoals phi(s, k-step_subgoal).
 """
 
 import logging
 import pickle
 import random
 import time
-from typing import Any, Callable, Literal, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, NamedTuple, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -45,7 +42,6 @@ from .losses import (
     update_critic,
     update_high_actor,
 )
-from .networks import HighActor
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs.Wrapper]
@@ -58,6 +54,7 @@ class TrainingState:
     gradient_steps: jnp.ndarray
     actor_state: TrainState
     critic_state: TrainState
+    target_critic_params: Any
     alpha_state: TrainState
     high_actor_state: TrainState
 
@@ -68,6 +65,21 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     discount: jnp.ndarray
     extras: Any = ()
+
+
+class Value(nn.Module):
+    layer_sizes: Tuple[int, ...] = (512, 512, 512)
+    use_ln: bool = False
+
+    @nn.compact
+    def __call__(self, state, z):
+        x = jnp.concatenate([state, z], axis=-1)
+        for hidden_size in self.layer_sizes:
+            x = nn.Dense(hidden_size)(x)
+            if self.use_ln:
+                x = nn.LayerNorm()(x)
+            x = nn.relu(x)
+        return nn.Dense(1)(x)
 
 
 def load_params(path: str):
@@ -92,9 +104,9 @@ def _pack_params(training_state: TrainingState):
 
 @dataclass
 class HCARL:
-    """Hierarchical CRL agent with one high actor and original CRL low actor + critic."""
     subgoal_steps: int = 25
     high_actor_hidden: Tuple[int, ...] = (512, 512, 512)
+    value_hidden: Tuple[int, ...] = (512, 512, 512)
     flat_policy: bool = False
 
     policy_lr: float = 3e-4
@@ -102,14 +114,9 @@ class HCARL:
     alpha_lr: float = 3e-4
     batch_size: int = 256
 
-    # gamma
     discount: float = 0.99
-
-    # forward CRL logsumexp penalty
     logsumexp_penalty_coeff: float = 0.1
-
     train_step_multiplier: int = 1
-
     disable_entropy_actor: bool = False
 
     max_replay_size: int = 10000
@@ -119,17 +126,35 @@ class HCARL:
     n_hidden: int = 2
     skip_connections: int = 4
     use_relu: bool = False
-
-    # phi(s,a) and psi(g) repr dimension
+    use_ln: bool = False
     repr_dim: int = 64
 
-    # layer norm
-    use_ln: bool = False
+    contrastive_loss_fn: str = "fwd_infonce"
+    energy_fn: str = "norm"
+    target_entropy_scale: float = 0.5
 
-    contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
-    energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
+    value_goal_eps: float = 0.5
+    value_loss_coeff: float = 1.0
+    expectile: float = 0.7
+    target_update_rate: float = 0.005
+    actor_beta: float = 1.0
+    actor_max_weight: float = 20.0
+    low_actor_beta: float = 1.0
+    low_actor_max_weight: float = 20.0
+    high_actor_beta: float = 1.0
+    high_actor_max_weight: float = 20.0
+    stop_value_encoder_grad: bool = True
 
-    # State coverage visualization
+    # HIQL/GCSDataset-style goal sampling.
+    p_randomgoal: float = 0.3
+    p_trajgoal: float = 0.5
+    p_currgoal: float = 0.2
+    geom_sample: int = 0
+    reward_scale: float = 1.0
+    reward_shift: float = 0.0
+    terminal: bool = False
+    high_p_randomgoal: float = 0.0
+
     log_state_coverage: bool = False
     state_coverage_xy_dims: Tuple[int, int] = (0, 1)
 
@@ -188,8 +213,7 @@ class HCARL:
 
         # Keep CRL component keys together. The high key is split after those so
         # adding hierarchy perturbs CRL initialization as little as possible.
-        key, sa_key, g_key, actor_key = jax.random.split(key, 4)
-        key, high_key = jax.random.split(key)
+        key, sg_key, a_key, actor_key, high_key, value_key = jax.random.split(key, 6)
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -200,7 +224,7 @@ class HCARL:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size
-        target_entropy = -0.5 * action_size
+        target_entropy = -self.target_entropy_scale * action_size
 
         # State coverage tracking.
         _raw_goal_indices = getattr(unwrapped_env, "goal_indices", None)
@@ -221,8 +245,8 @@ class HCARL:
                 )
         _coverage_history = [] if self.log_state_coverage else None
 
-        # Original CRL networks plus high actor.
-        sa_encoder_module = Encoder(
+        # CARL representation networks plus low/high actors and value.
+        sg_encoder_module = Encoder(
             repr_dim=self.repr_dim,
             network_width=self.h_dim,
             network_depth=self.n_hidden,
@@ -245,35 +269,50 @@ class HCARL:
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
+        # Paper-style high actor outputs a latent CARL subgoal z, not raw goal coordinates.
         high_actor_module = Actor(
-            action_size=goal_size,
+            action_size=self.repr_dim,
             network_width=self.h_dim,
             network_depth=self.n_hidden,
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
+        value_module = Value(
+            layer_sizes=self.value_hidden,
+            use_ln=self.use_ln,
+        )
         networks = {
-            "sg_encoder": sa_encoder_module,
+            "sg_encoder": sg_encoder_module,
             "a_encoder": a_encoder_module,
+            "value_module": value_module,
             "actor": actor_module,
             "high_actor": high_actor_module,
         }
 
         dummy_state = jnp.ones((1, state_size))
         dummy_goal = jnp.ones((1, goal_size))
-        dummy_action = jnp.ones((1, action_size))
+        # CARL action encoder receives the fixed-length action sequence (a_t, ..., a_{t+k-1}), flattened into one vector.
+        dummy_action = jnp.ones((1, action_size * self.subgoal_steps))
         dummy_obs = jnp.ones((1, obs_size))
         dummy_sg = jnp.concatenate([dummy_state, dummy_goal], axis=-1)
-        dummy_high_obs = jnp.concatenate([dummy_state, dummy_goal], axis=-1)
+        dummy_rep = jnp.ones((1, self.repr_dim))
 
-        sa_params = sa_encoder_module.init(sa_key, dummy_sg)
-        a_params = a_encoder_module.init(g_key, dummy_action)
-        actor_params = actor_module.init(actor_key, dummy_obs)
-        high_params = high_actor_module.init(high_key, dummy_high_obs)
+        sg_params = sg_encoder_module.init(sg_key, dummy_sg)
+        # Action encoder is initialized on flattened k-step action sequences.
+        a_params = a_encoder_module.init(a_key, dummy_action)
+        # Low actor is conditioned on [state, phi(state, goal/subgoal)].
+        dummy_actor_obs = jnp.ones((1, state_size + self.repr_dim))
+        actor_params = actor_module.init(actor_key, dummy_actor_obs)
+        high_params = high_actor_module.init(high_key, dummy_obs)
+        value_params = value_module.init(value_key, dummy_state, dummy_rep)
 
         critic_state = TrainState.create(
             apply_fn=None,
-            params={"sg_encoder": sa_params, "a_encoder": a_params},
+            params={
+                "sg_encoder": sg_params,
+                "a_encoder": a_params,
+                "value1": value_params,
+            },
             tx=optax.adam(learning_rate=self.critic_lr),
         )
         actor_state = TrainState.create(
@@ -296,6 +335,7 @@ class HCARL:
             gradient_steps=jnp.zeros(()),
             actor_state=actor_state,
             critic_state=critic_state,
+            target_critic_params=critic_state.params,
             alpha_state=alpha_state,
             high_actor_state=high_actor_state,
         )
@@ -332,9 +372,25 @@ class HCARL:
             contrastive_loss_fn=self.contrastive_loss_fn,
             energy_fn=self.energy_fn,
             logsumexp_penalty_coeff=self.logsumexp_penalty_coeff,
-            # New high actor weighting params. (only for policy gradient high level actor loss)
-            high_actor_beta=1.0,
-            high_actor_max_weight=20.0,
+            value_goal_eps=self.value_goal_eps,
+            value_loss_coeff=self.value_loss_coeff,
+            expectile=self.expectile,
+            target_update_rate=self.target_update_rate,
+            actor_beta=self.actor_beta,
+            actor_max_weight=self.actor_max_weight,
+            low_actor_beta=self.low_actor_beta,
+            low_actor_max_weight=self.low_actor_max_weight,
+            high_actor_beta=self.high_actor_beta,
+            high_actor_max_weight=self.high_actor_max_weight,
+            stop_value_encoder_grad=self.stop_value_encoder_grad,
+            p_randomgoal=self.p_randomgoal,
+            p_trajgoal=self.p_trajgoal,
+            p_currgoal=self.p_currgoal,
+            geom_sample=self.geom_sample,
+            reward_scale=self.reward_scale,
+            reward_shift=self.reward_shift,
+            terminal=self.terminal,
+            high_p_randomgoal=self.high_p_randomgoal,
         )
 
         _discount = float(self.discount)
@@ -343,80 +399,141 @@ class HCARL:
         _subgoal_steps = int(self.subgoal_steps)
         _flat_policy = bool(self.flat_policy)
 
-        def flatten_batch_hcarl(transition, sample_key):
-            """Original CRL future-goal relabeling plus optional hierarchy.
+        def flatten_batch_hcrl(transition, sample_key):
+            """HIQL GCSDataset-style sampling, kept close to the original code.
 
-            flat_policy=True:
-                observation = concat(state, CRL sampled future goal)
-                extras["future_state"] = CRL sampled future state
-
-            flat_policy=False:
-                high goal = CRL sampled future goal
-                low goal = k-step waypoint toward high goal
-                observation = concat(state, low goal)
-                extras["future_state"] = waypoint future state
+            Returns the same four objects as GCSDataset:
+                goals        -> value / flat-policy goals
+                low_goals    -> k-step goals for the low policy
+                high_goals   -> high-level policy goals
+                high_targets -> high-level waypoint targets
             """
             seq_len = transition.observation.shape[0]
-            arrangement = jnp.arange(seq_len)
+            indx = jnp.arange(seq_len)
             traj_ids = transition.extras["state_extras"]["traj_id"]
 
-            is_future_mask = jnp.array(
-                arrangement[:, None] < arrangement[None], dtype=jnp.float32
+            # Equivalent of terminal_locs[searchsorted(terminal_locs, indx)] inside this sampled trajectory chunk.
+            same_traj = jnp.equal(traj_ids[:, None], traj_ids[None, :])
+            future_or_self = indx[None, :] >= indx[:, None]
+            final_indx = jnp.max(
+                jnp.where(same_traj & future_or_self, indx[None, :], indx[:, None]),
+                axis=1,
             )
-            discount = _discount ** jnp.array(
-                arrangement[None] - arrangement[:, None], dtype=jnp.float32
+
+            def sample_goals(key, p_randomgoal, p_trajgoal, p_currgoal):
+                random_key, traj_key, traj_pick_key, curr_key, geom_key = jax.random.split(key, 5)
+                goal_indx = jax.random.randint(random_key, shape=(seq_len,), minval=0, maxval=seq_len)
+
+                if bool(self.geom_sample):
+                    us = jax.random.uniform(geom_key, shape=(seq_len,))
+                    offset = jnp.ceil(
+                        jnp.log(1.0 - us + 1e-8) / jnp.log(jnp.minimum(_discount, 0.999999))
+                    ).astype(jnp.int32)
+                    middle_goal_indx = jnp.minimum(indx + offset, final_indx)
+                else:
+                    distance = jax.random.uniform(traj_key, shape=(seq_len,))
+                    middle_goal_indx = jnp.round(
+                        jnp.minimum(indx + 1, final_indx).astype(jnp.float32) * distance
+                        + final_indx.astype(jnp.float32) * (1.0 - distance)
+                    ).astype(jnp.int32)
+
+                traj_prob = p_trajgoal / jnp.maximum(1.0 - p_currgoal, 1e-6)
+                goal_indx = jnp.where(
+                    jax.random.uniform(traj_pick_key, shape=(seq_len,)) < traj_prob,
+                    middle_goal_indx,
+                    goal_indx,
+                )
+                goal_indx = jnp.where(
+                    jax.random.uniform(curr_key, shape=(seq_len,)) < p_currgoal,
+                    indx,
+                    goal_indx,
+                )
+                return goal_indx
+
+            goal_key, high_traj_key, high_random_key, high_pick_key = jax.random.split(sample_key, 4)
+
+            # Same as GCDataset.sample(): sample relabelled goals and recompute reward/mask.
+            goal_indx = sample_goals(
+                goal_key,
+                float(self.p_randomgoal),
+                float(self.p_trajgoal),
+                float(self.p_currgoal),
             )
-            probs = is_future_mask * discount
+            success = (goal_indx == indx).astype(jnp.float32)
+            reward = success * float(self.reward_scale) + float(self.reward_shift)
+            mask = jnp.where(bool(self.terminal), 1.0 - success, jnp.ones_like(success))
+            goals = jnp.take(transition.observation, goal_indx, axis=0)[:, _goal_indices_arr]
 
-            single_trajectories = jnp.concatenate(
-                [traj_ids[:, jnp.newaxis].T] * seq_len,
-                axis=0,
+            # Same as GCSDataset.sample(): low_goals = s_{t+k}.
+            way_indx = jnp.minimum(indx + _subgoal_steps, final_indx)
+            way_obs = jnp.take(transition.observation, way_indx, axis=0)
+            low_goals = way_obs[:, _goal_indices_arr]
+
+            # Same as GCSDataset.sample(): high_goals and high_targets.
+            high_traj_goal_indx = sample_goals(high_traj_key, 0.0, 1.0, 0.0)
+            high_traj_target_indx = jnp.minimum(indx + _subgoal_steps, high_traj_goal_indx)
+
+            high_random_goal_indx = jax.random.randint(
+                high_random_key,
+                shape=(seq_len,),
+                minval=0,
+                maxval=seq_len,
             )
-            probs = probs * jnp.equal(single_trajectories, single_trajectories.T)
-            probs = probs + jnp.eye(seq_len) * 1e-5
+            high_random_target_indx = way_indx
 
-            # Exact CRL sampled future index.
-            future_goal_idx = jax.random.categorical(sample_key, jnp.log(probs))
+            pick_random = jax.random.uniform(high_pick_key, shape=(seq_len,)) < float(self.high_p_randomgoal)
+            high_goal_indx = jnp.where(pick_random, high_random_goal_indx, high_traj_goal_indx)
+            high_target_indx = jnp.where(pick_random, high_random_target_indx, high_traj_target_indx)
 
-            # Hierarchical waypoint toward the sampled future goal.
-            waypoint_idx = jnp.minimum(arrangement + _subgoal_steps, future_goal_idx)
-            low_goal_idx = jnp.where(_flat_policy, future_goal_idx, waypoint_idx)
+            high_goals = jnp.take(transition.observation, high_goal_indx, axis=0)[:, _goal_indices_arr]
+            high_targets_full = jnp.take(transition.observation, high_target_indx, axis=0)
+            high_targets = high_targets_full[:, _goal_indices_arr]
 
             state = transition.observation[:-1, :_state_size]
+            next_state = transition.observation[1:, :_state_size]
+
+            # Low actor is still trained on the first primitive action a_t.
             action = transition.action[:-1]
-            reward = transition.reward[:-1]
-            discount_t = transition.discount[:-1]
 
-            # This is the future state used by original CRL actor loss.
-            low_future_state_full = jnp.take(transition.observation, low_goal_idx[:-1], axis=0)
-            low_goal = low_future_state_full[:, _goal_indices_arr]
-            low_future_state = low_future_state_full[:, :_state_size]
+            action_offsets = jnp.arange(_subgoal_steps)
+            last_action_indx = jnp.maximum(indx, final_indx - 1)
+            action_seq_indx = jnp.minimum(
+                indx[:, None] + action_offsets[None, :],
+                last_action_indx[:, None],
+            )
+            action_seq = jnp.take(transition.action, action_seq_indx, axis=0)
+            action_seq = jnp.reshape(action_seq, (seq_len, _subgoal_steps * action_size))
 
-            crl_obs = jnp.concatenate([state, low_goal], axis=-1)
-
-            # Extra high-actor targets. These are ignored in flat mode.
-            high_goal_full = jnp.take(transition.observation, future_goal_idx[:-1], axis=0)
-            high_target_full = jnp.take(transition.observation, waypoint_idx[:-1], axis=0)
+            actor_goals = jnp.where(_flat_policy, goals, low_goals)
 
             return Transition(
-                observation=crl_obs,
+                observation=jnp.concatenate([state, actor_goals[:-1]], axis=-1),
                 action=action,
-                reward=reward,
-                discount=discount_t,
+                reward=reward[:-1],
+                discount=mask[:-1] * transition.discount[:-1],
                 extras={
-                    # Required by original CRL actor loss.
-                    "future_state": low_future_state,
-                    # Only used by HCARL high actor.
+                    "future_state": way_obs[:-1, :_state_size],
+                    "next_state": next_state,
                     "state": state,
-                    "high_actor_goal": high_goal_full[:, _goal_indices_arr],
-                    "high_actor_target_goal": high_target_full[:, _goal_indices_arr],
-                    "high_actor_target_state": high_target_full[:, :_state_size],
+                    "value_goal": goals[:-1],
+                    "low_actor_goal": low_goals[:-1],
+                    "low_actor_state": way_obs[:-1, :_state_size],
+                    "action_sequence": action_seq[:-1],
+                    "high_actor_goal": high_goals[:-1],
+                    "high_actor_target_goal": high_targets[:-1],
+                    "high_actor_target_state": high_targets_full[:-1, :_state_size],
+                    "hiql_value_goal_success": success[:-1],
+                    "hiql_pick_random_high_goal": pick_random[:-1].astype(jnp.float32),
                 },
             )
 
         def _get_action(params, state, goal, key, deterministic):
             if _flat_policy:
-                actor_goal = goal
+                # Flat mode still uses the CARL representation as the actor goal.
+                actor_goal = sg_encoder_module.apply(
+                    params["sg_encoder"],
+                    jnp.concatenate([state, goal], axis=-1),
+                )
             else:
                 high_key, key = jax.random.split(key)
                 high_obs = jnp.concatenate([state, goal], axis=-1)
@@ -514,26 +631,6 @@ class HCARL:
                 length=num_prefill_actor_steps,
             )[0]
 
-        def make_positive_negative_actions(key):
-            key_pos, key_neg = jax.random.split(key)
-            buffer_state, transitions = replay_buffer.sample(buffer_state, batch_size)
-            state = transitions.observation[:, :state_size]
-            goal = transitions.observation[:, state_size:]
-            action = transitions.action
-            pos_obs, pos_action, pos_goal, neg_obs, neg_action, neg_goal = state[:1], action[:1], goal[:1], state[:1], action[1:], goal[:1]
-            pos_obs = jnp.repeat(pos_obs, repeats=self.batch_size - 1, axis=0)
-            pos_action = jnp.repeat(pos_action, repeats=self.batch_size - 1, axis=0)
-            pos_goal = jnp.repeat(pos_goal, repeats=self.batch_size - 1, axis=0)
-            neg_obs = neg_obs
-            neg_action = neg_action
-            neg_goal = neg_goal
-            # Shuffle negative samples.
-            perm = jax.random.permutation(key_neg, self.batch_size - 1)
-            neg_obs = neg_obs[perm]
-            neg_action = neg_action[perm]
-            neg_goal = neg_goal[perm]
-            return pos_obs, pos_action, pos_goal, neg_obs, neg_action, neg_goal
-
         @jax.jit
         def update_networks(carry, batch):
             training_state, key = carry
@@ -552,6 +649,10 @@ class HCARL:
                     "high_actor_log_prob": jnp.array(0.0),
                     "high_actor_mse": jnp.array(0.0),
                     "high_actor_std": jnp.array(0.0),
+                    "high_actor_weight": jnp.array(0.0),
+                    "high_actor_adv": jnp.array(0.0),
+                    "high_actor_v_curr": jnp.array(0.0),
+                    "high_actor_v_next": jnp.array(0.0),
                 }
             else:
                 training_state, high_actor_metrics = update_high_actor(
@@ -580,7 +681,7 @@ class HCARL:
 
             buffer_state, transitions = replay_buffer.sample(buffer_state)
             batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
-            batches = jax.vmap(flatten_batch_hcarl)(transitions, batch_keys)
+            batches = jax.vmap(flatten_batch_hcrl)(transitions, batch_keys)
             batches = jax.tree_util.tree_map(
                 lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), batches
             )
@@ -631,22 +732,24 @@ class HCARL:
         )
 
         def _make_policy(param):
-            if _flat_policy:
-                # Match the original CRL make_policy style as closely as possible.
-                return lambda obs, rng: actor_module.apply(param["actor"], obs)
-
             def _policy(obs, rng):
                 s = obs[:, :state_size]
                 g = obs[:, state_size:]
-                high_obs = jnp.concatenate([s, g], axis=-1)
-                subgoal_mean, _ = high_actor_module.apply(param["high_actor"], high_obs)
-                low_obs = jnp.concatenate([s, subgoal_mean], axis=-1)
+                if _flat_policy:
+                    actor_goal = sg_encoder_module.apply(
+                        param["sg_encoder"],
+                        jnp.concatenate([s, g], axis=-1),
+                    )
+                else:
+                    high_obs = jnp.concatenate([s, g], axis=-1)
+                    actor_goal, _ = high_actor_module.apply(param["high_actor"], high_obs)
+                low_obs = jnp.concatenate([s, actor_goal], axis=-1)
                 return actor_module.apply(param["actor"], low_obs)
 
             return _policy
 
         training_walltime = 0.0
-        logging.info("starting HCARL = CRL + high actor training....")
+        logging.info("starting HCARL = CARL representation + value/AWR training....")
 
         for ne in range(config.num_evals):
             t = time.time()
