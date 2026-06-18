@@ -181,6 +181,8 @@ def main(config: Config):
             "training/alpha_loss",
             "training/critic_loss",
             "training/entropy",
+            "training/actor_sample_noise",
+            "training/actor_action_abs_mean",
 
             # Critic diagnostics.
             "training/categorical_accuracy",
@@ -194,6 +196,8 @@ def main(config: Config):
             "training/high_actor_log_prob",
             "training/high_actor_mse",
             "training/high_actor_std",
+            "training/high_actor_log_std_mean",
+            "training/high_actor_latent_noise_mean",
 
             # Replay/training diagnostics.
             "training/buffer_current_size",
