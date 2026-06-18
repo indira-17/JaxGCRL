@@ -236,6 +236,11 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
 
         loss = -jnp.mean(weight * log_prob)
 
+        # for logging action noise
+        mean_action = nn.tanh(mean)
+        actor_sample_noise = jnp.mean(jnp.abs(action - mean_action))
+        actor_action_abs_mean = jnp.mean(jnp.abs(action))
+
         return loss, {
             "actor_loss": loss,
             "actor_log_prob": jnp.mean(log_prob),
@@ -310,6 +315,10 @@ def update_high_actor(config, networks, transitions, training_state, key):
         weight = jnp.clip(weight, 0.0, max_weight)
 
         loss = -jnp.mean(weight * log_prob)
+
+        # for logging action noise
+        high_latent_noise_mean = jnp.mean(std)
+        high_log_std_mean = jnp.mean(log_std)
 
         return loss, {
             "high_actor_loss": loss,
