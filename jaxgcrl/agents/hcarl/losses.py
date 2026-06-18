@@ -54,25 +54,27 @@ def contrastive_loss_fn(name, logits):
 
 
 def update_critic(config, networks, transitions, training_state, key):
-    """CARL representation loss + HIQL-style value loss with target V network."""
+    """CARL representation update + separate HIQL-style value update."""
+    del key
 
-    def critic_loss(critic_params, target_critic_params, transitions, key):
-        del key
+    obs = transitions.observation
+    state = obs[:, : config["state_size"]]
+    low_goal = obs[:, config["state_size"] :]
+    value_goal = transitions.extras["value_goal"]
+    next_state = transitions.extras["next_state"]
+    action_sequence = transitions.extras["action_sequence"]
 
-        obs = transitions.observation
-        state = obs[:, : config["state_size"]]
-        low_goal = obs[:, config["state_size"] :]
-        value_goal = transitions.extras["value_goal"]
-        next_state = transitions.extras["next_state"]
-        # Primitive action is used by the low actor.
-        # CARL uses the k-step action sequence that actually led toward the sampled subgoal.
-        action = transitions.action
-        action_sequence = transitions.extras["action_sequence"]
+    critic_params = training_state.critic_state.params
+    rep_params = {
+        "sg_encoder": critic_params["sg_encoder"],
+        "a_encoder": critic_params["a_encoder"],
+    }
+    value_params = critic_params["value1"]
+    target_value_params = training_state.target_critic_params["value1"]
 
-        sg_encoder_params = critic_params["sg_encoder"]
-        a_encoder_params = critic_params["a_encoder"]
-        value_params = critic_params["value1"]
-        target_value_params = target_critic_params["value1"]
+    def carl_loss_fn(rep_params):
+        sg_encoder_params = rep_params["sg_encoder"]
+        a_encoder_params = rep_params["a_encoder"]
 
         # CARL representation loss: InfoNCE on (state, low_goal, action_sequence)
         sg_repr = networks["sg_encoder"].apply(
@@ -94,6 +96,18 @@ def update_critic(config, networks, transitions, training_state, key):
         correct = jnp.argmax(logits, axis=1) == jnp.arange(logits.shape[0])
         logits_pos = jnp.sum(logits * eye) / jnp.sum(eye)
         logits_neg = jnp.sum(logits * (1.0 - eye)) / jnp.sum(1.0 - eye)
+
+        return carl_loss, {
+            "carl_loss": carl_loss,
+            "categorical_accuracy": jnp.mean(correct),
+            "logits_pos": logits_pos,
+            "logits_neg": logits_neg,
+            "logsumexp": jnp.mean(logsumexp),
+            "action_seq_norm": jnp.mean(jnp.linalg.norm(action_sequence, axis=-1)),
+        }
+
+    def value_loss_fn(value_params, rep_params, target_value_params):
+        sg_encoder_params = rep_params["sg_encoder"]
 
         # HIQL value loss: V(s_t, phi(s_t, g)) with target network V_bar. g is the sampled final goal, not the low-level waypoint.
         z_curr = networks["sg_encoder"].apply(
@@ -126,49 +140,50 @@ def update_critic(config, networks, transitions, training_state, key):
         expectile = config.get("expectile", 0.7)
         value_weight = jnp.where(diff > 0.0, expectile, 1.0 - expectile)
         value_loss = jnp.mean(value_weight * diff**2)
+        value_update_loss = config.get("value_loss_coeff", 1.0) * value_loss
 
-        total_loss = carl_loss + config.get("value_loss_coeff", 1.0) * value_loss
-
-        return total_loss, {
-            "critic_loss": total_loss,
-            "carl_loss": carl_loss,
+        return value_update_loss, {
             "value_loss": value_loss,
             "value_mean": jnp.mean(v_curr),
             "value_target_mean": jnp.mean(target_v),
             "value_adv_mean": jnp.mean(diff),
             "value_reward_mean": jnp.mean(transitions.reward),
-            "value_discount_mean": jnp.mean(transitions.discount),
             "value_goal_success": jnp.mean(transitions.extras["hiql_value_goal_success"]),
-            "action_seq_norm": jnp.mean(jnp.linalg.norm(action_sequence, axis=-1)),
             "target_value_mean": jnp.mean(v_next),
-            "categorical_accuracy": jnp.mean(correct),
-            "logits_pos": logits_pos,
-            "logits_neg": logits_neg,
-            "logsumexp": jnp.mean(logsumexp),
         }
 
-    (loss, metrics), grad = jax.value_and_grad(critic_loss, has_aux=True)(
-        training_state.critic_state.params,
-        training_state.target_critic_params,
-        transitions,
-        key,
+    (carl_loss, carl_metrics), rep_grad = jax.value_and_grad(carl_loss_fn, has_aux=True)(rep_params)
+    (value_update_loss, value_metrics), value_grad = jax.value_and_grad(value_loss_fn, has_aux=True)(
+        value_params,
+        rep_params,
+        target_value_params,
     )
-    del loss
 
+    grad = {
+        "sg_encoder": rep_grad["sg_encoder"],
+        "a_encoder": rep_grad["a_encoder"],
+        "value1": value_grad,
+    }
     new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+
     target_tau = config.get("target_update_rate", 0.005)
-    new_target_critic_params = jax.tree_util.tree_map(
+    new_target_value_params = jax.tree_util.tree_map(
         lambda target, online: (1.0 - target_tau) * target + target_tau * online,
-        training_state.target_critic_params,
-        new_critic_state.params,
+        training_state.target_critic_params["value1"],
+        new_critic_state.params["value1"],
     )
+    new_target_critic_params = dict(training_state.target_critic_params)
+    new_target_critic_params["value1"] = new_target_value_params
 
     training_state = training_state.replace(
         critic_state=new_critic_state,
         target_critic_params=new_target_critic_params,
     )
-    return training_state, metrics
 
+    metrics = {"critic_loss": carl_loss + value_update_loss}
+    metrics.update(carl_metrics)
+    metrics.update(value_metrics)
+    return training_state, metrics
 
 def update_actor_and_alpha(config, networks, transitions, training_state, key):
     """Low actor AWR loss: weighted NLL on replay action, no SAC-Q update."""
@@ -207,9 +222,7 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
             loc=mean,
             scale=std,
         )
-        log_prob -= 2.0 * (
-            jnp.log(2.0) - pre_tanh_action - nn.softplus(-2.0 * pre_tanh_action)
-        )
+        log_prob -= 2.0 * (jnp.log(2.0) - pre_tanh_action - nn.softplus(-2.0 * pre_tanh_action))
         log_prob = log_prob.sum(-1)
 
         v_curr = networks["value_module"].apply(value_params, state, z_curr).squeeze(-1)
@@ -223,6 +236,11 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
 
         loss = -jnp.mean(weight * log_prob)
 
+        # for logging action noise
+        mean_action = nn.tanh(mean)
+        actor_sample_noise = jnp.mean(jnp.abs(action - mean_action))
+        actor_action_abs_mean = jnp.mean(jnp.abs(action))
+
         return loss, {
             "actor_loss": loss,
             "actor_log_prob": jnp.mean(log_prob),
@@ -235,6 +253,8 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
             "actor_std": jnp.mean(std),
             "alpha_loss": jnp.array(0.0),
             "log_alpha": training_state.alpha_state.params["log_alpha"],
+            "actor_sample_noise": actor_sample_noise,
+            "actor_action_abs_mean": actor_action_abs_mean,
         }
 
     (loss, metrics), grad = jax.value_and_grad(actor_loss, has_aux=True)(
@@ -296,6 +316,10 @@ def update_high_actor(config, networks, transitions, training_state, key):
 
         loss = -jnp.mean(weight * log_prob)
 
+        # for logging action noise
+        high_latent_noise_mean = jnp.mean(std)
+        high_log_std_mean = jnp.mean(log_std)
+
         return loss, {
             "high_actor_loss": loss,
             "high_actor_log_prob": jnp.mean(log_prob),
@@ -305,6 +329,8 @@ def update_high_actor(config, networks, transitions, training_state, key):
             "high_actor_adv": jnp.mean(adv),
             "high_actor_v_curr": jnp.mean(v_curr),
             "high_actor_v_next": jnp.mean(v_next),
+            "high_log_std_mean": high_log_std_mean,
+            "high_latent_noise_mean": high_latent_noise_mean,
         }
 
     (loss, metrics), grad = jax.value_and_grad(high_actor_loss, has_aux=True)(

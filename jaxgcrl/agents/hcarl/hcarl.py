@@ -653,6 +653,8 @@ class HCARL:
                     "high_actor_adv": jnp.array(0.0),
                     "high_actor_v_curr": jnp.array(0.0),
                     "high_actor_v_next": jnp.array(0.0),
+                    "high_log_std_mean": jnp.array(0.0),
+                    "high_latent_noise_mean": jnp.array(0.0),
                 }
             else:
                 training_state, high_actor_metrics = update_high_actor(
