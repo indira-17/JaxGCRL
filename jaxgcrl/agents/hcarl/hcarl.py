@@ -288,7 +288,7 @@ class HCARL:
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
-        # Paper-style high actor outputs a latent CARL subgoal z, not raw goal coordinates.
+        # High actor outputs raw goal coordinates.
         high_actor_module = Actor(
             action_size=goal_size,
             network_width=self.h_dim,
@@ -546,12 +546,10 @@ class HCARL:
                 train_mask = mask[:-1]
                 train_success = success[:-1]
             else:
-                # Raw high-actor subgoal that generated action a_t.
-                train_goal = stored_low_actor_goals[:-1]  # [seq_len - 1, goal_size]
-
+                train_goal = stored_low_actor_goals[:-1]
                 next_goal_state = next_state[:, _goal_indices_arr]
                 train_success = (jnp.linalg.norm(next_goal_state - train_goal, axis=-1) < float(self.value_goal_eps)).astype(jnp.float32)
-                train_reward = (train_success * float(self.reward_scale) + float(self.reward_shift))
+                train_reward = train_success * float(self.reward_scale) + float(self.reward_shift)
                 train_mask = jnp.where(bool(self.terminal), 1.0 - train_success, jnp.ones_like(train_success))
 
             return Transition(
@@ -577,11 +575,7 @@ class HCARL:
 
         def _get_action(params, state, goal, key, deterministic):
             if _flat_policy:
-                # Flat mode still uses the CARL representation as the actor goal.
-                raw_actor_goal = sg_encoder_module.apply(
-                    params["sg_encoder"],
-                    jnp.concatenate([state, goal], axis=-1),
-                )
+                raw_actor_goal = goal
             else:
                 high_key, key = jax.random.split(key)
                 high_obs = jnp.concatenate([state, goal], axis=-1)
