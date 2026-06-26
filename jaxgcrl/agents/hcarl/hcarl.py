@@ -26,6 +26,7 @@ from brax import base, envs
 from brax.training import types
 from etils import epath
 from flax.struct import dataclass
+from flax.training import checkpoints
 from flax.training.train_state import TrainState
 
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
@@ -40,7 +41,6 @@ from .losses import (
     _tanh_normal_sample,
     update_actor_and_alpha,
     update_critic,
-    update_high_actor,
 )
 
 Metrics = types.Metrics
@@ -88,6 +88,21 @@ def load_params(path: str):
     return pickle.loads(buf)
 
 
+def load_carl_params(path: str):
+    """Loads separate HCARL encoder parameter trees from a CARL checkpoint."""
+    params = checkpoints.restore_checkpoint(path, target=None)
+    if "params" in params and "sg_encoder" in params["params"]:
+        params = params["params"]
+
+    sg_params = params["sg_encoder"]
+    a_params = params["a_encoder"]
+    if "params" not in sg_params:
+        sg_params = {"params": sg_params}
+    if "params" not in a_params:
+        a_params = {"params": a_params}
+    return sg_params, a_params
+
+
 def save_params(path: str, params: Any):
     with epath.Path(path).open("wb") as fout:
         fout.write(pickle.dumps(params))
@@ -128,6 +143,10 @@ class HCARL:
     use_relu: bool = False
     use_ln: bool = False
     repr_dim: int = 64
+
+    is_pretrain_carl_high: bool = False
+    pretrained_carl_path: Optional[str] = "/scratch/cluster/idutta/JaxGCRL/jaxgcrl/checkpoints/antmaze-medium-navigate-v0/rep_params_89400/checkpoint"
+    pretrained_high_actor_path: Optional[str] = "/scratch/cluster/idutta/JaxGCRL/jaxgcrl/checkpoints/high_actor/hcrl_high_actor_step_20744704.pkl"
 
     contrastive_loss_fn: str = "fwd_infonce"
     energy_fn: str = "norm"
@@ -271,7 +290,7 @@ class HCARL:
         )
         # Paper-style high actor outputs a latent CARL subgoal z, not raw goal coordinates.
         high_actor_module = Actor(
-            action_size=self.repr_dim,
+            action_size=goal_size,
             network_width=self.h_dim,
             network_depth=self.n_hidden,
             skip_connections=self.skip_connections,
@@ -305,6 +324,19 @@ class HCARL:
         actor_params = actor_module.init(actor_key, dummy_actor_obs)
         high_params = high_actor_module.init(high_key, dummy_obs)
         value_params = value_module.init(value_key, dummy_state, dummy_rep)
+
+        if self.is_pretrain_carl_high:
+            if not self.pretrained_carl_path:
+                raise ValueError("pretrained_carl_path is required when is_pretrain_carl_high=True")
+            if not self.pretrained_high_actor_path:
+                raise ValueError("pretrained_high_actor_path is required when is_pretrain_carl_high=True")
+
+            sg_params, a_params = load_carl_params(self.pretrained_carl_path)
+            high_params = load_params(self.pretrained_high_actor_path)
+            if "high_actor" in high_params:
+                high_params = high_params["high_actor"]
+            logging.info("Loaded frozen CARL checkpoint from %s", self.pretrained_carl_path)
+            logging.info("Loaded frozen high actor checkpoint from %s", self.pretrained_high_actor_path)
 
         critic_state = TrainState.create(
             apply_fn=None,
@@ -345,7 +377,7 @@ class HCARL:
             action=jnp.zeros((action_size,)),
             reward=0.0,
             discount=0.0,
-            extras={"state_extras": {"truncation": 0.0, "traj_id": 0.0}},
+            extras={"state_extras": {"truncation": 0.0, "traj_id": 0.0}, 'low_actor_goals': jnp.zeros((goal_size,))},
         )
 
         def jit_wrap(buffer):
@@ -391,6 +423,7 @@ class HCARL:
             reward_shift=self.reward_shift,
             terminal=self.terminal,
             high_p_randomgoal=self.high_p_randomgoal,
+            flat_policy=self.flat_policy,
         )
 
         _discount = float(self.discount)
@@ -453,6 +486,7 @@ class HCARL:
             goal_key, high_traj_key, high_random_key, high_pick_key = jax.random.split(sample_key, 4)
 
             # Same as GCDataset.sample(): sample relabelled goals and recompute reward/mask.
+            # Not used for now
             goal_indx = sample_goals(
                 goal_key,
                 float(self.p_randomgoal),
@@ -469,6 +503,7 @@ class HCARL:
             way_obs = jnp.take(transition.observation, way_indx, axis=0)
             low_goals = way_obs[:, _goal_indices_arr]
 
+            # Not used for pretrained high actor
             # Same as GCSDataset.sample(): high_goals and high_targets.
             high_traj_goal_indx = sample_goals(high_traj_key, 0.0, 1.0, 0.0)
             high_traj_target_indx = jnp.minimum(indx + _subgoal_steps, high_traj_goal_indx)
@@ -503,26 +538,39 @@ class HCARL:
             )
             action_seq = jnp.take(transition.action, action_seq_indx, axis=0)
             action_seq = jnp.reshape(action_seq, (seq_len, _subgoal_steps * action_size))
+            stored_low_actor_goals = transition.extras["low_actor_goals"]
 
-            actor_goals = jnp.where(_flat_policy, goals, low_goals)
+            if _flat_policy:
+                train_goal = goals[:-1]
+                train_reward = reward[:-1]
+                train_mask = mask[:-1]
+                train_success = success[:-1]
+            else:
+                # Raw high-actor subgoal that generated action a_t.
+                train_goal = stored_low_actor_goals[:-1]  # [seq_len - 1, goal_size]
+
+                next_goal_state = next_state[:, _goal_indices_arr]
+                train_success = (jnp.linalg.norm(next_goal_state - train_goal, axis=-1) < float(self.value_goal_eps)).astype(jnp.float32)
+                train_reward = (train_success * float(self.reward_scale) + float(self.reward_shift))
+                train_mask = jnp.where(bool(self.terminal), 1.0 - train_success, jnp.ones_like(train_success))
 
             return Transition(
-                observation=jnp.concatenate([state, actor_goals[:-1]], axis=-1),
+                observation=jnp.concatenate([state, train_goal], axis=-1),
                 action=action,
-                reward=reward[:-1],
-                discount=mask[:-1] * transition.discount[:-1],
+                reward=train_reward,
+                discount=train_mask * transition.discount[:-1],
                 extras={
                     "future_state": way_obs[:-1, :_state_size],
                     "next_state": next_state,
                     "state": state,
-                    "value_goal": goals[:-1],
-                    "low_actor_goal": low_goals[:-1],
-                    "low_actor_state": way_obs[:-1, :_state_size],
+                    "value_goal": train_goal,
+                    "low_actor_goal": train_goal,
+                    "next_low_actor_goal": train_goal,
                     "action_sequence": action_seq[:-1],
                     "high_actor_goal": high_goals[:-1],
                     "high_actor_target_goal": high_targets[:-1],
                     "high_actor_target_state": high_targets_full[:-1, :_state_size],
-                    "hiql_value_goal_success": success[:-1],
+                    "hiql_value_goal_success": train_success,
                     "hiql_pick_random_high_goal": pick_random[:-1].astype(jnp.float32),
                 },
             )
@@ -530,7 +578,7 @@ class HCARL:
         def _get_action(params, state, goal, key, deterministic):
             if _flat_policy:
                 # Flat mode still uses the CARL representation as the actor goal.
-                actor_goal = sg_encoder_module.apply(
+                raw_actor_goal = sg_encoder_module.apply(
                     params["sg_encoder"],
                     jnp.concatenate([state, goal], axis=-1),
                 )
@@ -541,23 +589,27 @@ class HCARL:
                     params["high_actor"], high_obs
                 )
                 if deterministic:
-                    actor_goal = subgoal_mean
+                    raw_actor_goal = subgoal_mean
                 else:
-                    actor_goal, _ = _normal_sample(subgoal_mean, subgoal_log_std, high_key)
+                    raw_actor_goal, _ = _normal_sample(subgoal_mean, subgoal_log_std, high_key)
 
+            actor_goal = sg_encoder_module.apply(
+                params["sg_encoder"],
+                jnp.concatenate([state, raw_actor_goal], axis=-1),
+            )
             actor_obs = jnp.concatenate([state, actor_goal], axis=-1)
             mean, log_std = actor_module.apply(params["actor"], actor_obs)
             if deterministic:
                 action = nn.tanh(mean)
             else:
                 action, _ = _tanh_normal_sample(mean, log_std, key)
-            return action
+            return action, raw_actor_goal
 
         def actor_step(training_state, env, env_state, key, extra_fields):
             obs = env_state.obs
             state = obs[:, :state_size]
             goal = obs[:, state_size:]
-            actions = _get_action(_pack_params(training_state), state, goal, key, deterministic=False)
+            actions, low_actor_goals = _get_action(_pack_params(training_state), state, goal, key, deterministic=False)
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
             return nstate, Transition(
@@ -565,14 +617,14 @@ class HCARL:
                 action=actions,
                 reward=nstate.reward,
                 discount=1 - nstate.done,
-                extras={"state_extras": state_extras},
+                extras={"state_extras": state_extras, "low_actor_goals": low_actor_goals},
             )
 
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
             obs = env_state.obs
             state = obs[:, :state_size]
             goal = obs[:, state_size:]
-            actions = _get_action(
+            actions, low_actor_goals = _get_action(
                 _pack_params(training_state),
                 state,
                 goal,
@@ -586,7 +638,7 @@ class HCARL:
                 action=actions,
                 reward=nstate.reward,
                 discount=1 - nstate.done,
-                extras={"state_extras": state_extras},
+                extras={"state_extras": state_extras, "low_actor_goals": low_actor_goals},
             )
 
         @jax.jit
@@ -643,23 +695,19 @@ class HCARL:
                 crl_config, networks, batch, training_state, actor_key
             )
 
-            if _flat_policy:
-                high_actor_metrics = {
-                    "high_actor_loss": jnp.array(0.0),
-                    "high_actor_log_prob": jnp.array(0.0),
-                    "high_actor_mse": jnp.array(0.0),
-                    "high_actor_std": jnp.array(0.0),
-                    "high_actor_weight": jnp.array(0.0),
-                    "high_actor_adv": jnp.array(0.0),
-                    "high_actor_v_curr": jnp.array(0.0),
-                    "high_actor_v_next": jnp.array(0.0),
-                    "high_log_std_mean": jnp.array(0.0),
-                    "high_latent_noise_mean": jnp.array(0.0),
-                }
-            else:
-                training_state, high_actor_metrics = update_high_actor(
-                    crl_config, networks, batch, training_state, high_actor_key
-                )
+            # The high actor is loaded once and kept frozen.
+            high_actor_metrics = {
+                "high_actor_loss": jnp.array(0.0),
+                "high_actor_log_prob": jnp.array(0.0),
+                "high_actor_mse": jnp.array(0.0),
+                "high_actor_std": jnp.array(0.0),
+                "high_actor_weight": jnp.array(0.0),
+                "high_actor_adv": jnp.array(0.0),
+                "high_actor_v_curr": jnp.array(0.0),
+                "high_actor_v_next": jnp.array(0.0),
+                "high_log_std_mean": jnp.array(0.0),
+                "high_latent_noise_mean": jnp.array(0.0),
+            }
 
             training_state = training_state.replace(
                 gradient_steps=training_state.gradient_steps + 1
@@ -745,6 +793,10 @@ class HCARL:
                 else:
                     high_obs = jnp.concatenate([s, g], axis=-1)
                     actor_goal, _ = high_actor_module.apply(param["high_actor"], high_obs)
+                    actor_goal = sg_encoder_module.apply(
+                        param["sg_encoder"],
+                        jnp.concatenate([s, actor_goal], axis=-1),
+                    )
                 low_obs = jnp.concatenate([s, actor_goal], axis=-1)
                 return actor_module.apply(param["actor"], low_obs)
 

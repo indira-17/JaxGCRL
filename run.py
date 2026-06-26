@@ -185,6 +185,7 @@ def main(config: Config):
             "training/actor_action_abs_mean",
 
             # Critic diagnostics.
+            "training/carl_loss",
             "training/categorical_accuracy",
             "training/logits_pos",
             "training/logits_neg",
