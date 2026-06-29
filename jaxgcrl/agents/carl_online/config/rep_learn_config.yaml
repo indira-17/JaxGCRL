@@ -24,7 +24,7 @@ rep_learn:
   rep_dim: 512
   hidden_sizes: [256, 256]
   # Must match SAC's nce_k_step so ActionsEncoder input dims are compatible.
-  nce_k_step: 25
+  nce_k_step: 1
   batch_size: 1024
   val_num_batches: 8
   eval_interval: 100

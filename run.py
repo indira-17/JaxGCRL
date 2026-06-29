@@ -176,11 +176,15 @@ def main(config: Config):
         ],
         "HCARL": [
             # Original CRL losses.
-            "training/actor_loss",
-            "training/log_alpha",
-            "training/alpha_loss",
             "training/critic_loss",
-            "training/entropy",
+            "training/goal_action_loss",
+            "training/action_prior_loss",
+            "training/actor_loss",
+            "training/pmi_q",
+            "training/buffer_action_nll",
+            "training/actor_mse",
+            "training/actor_std",
+            "training/log_alpha",
             "training/actor_sample_noise",
             "training/actor_action_abs_mean",
 

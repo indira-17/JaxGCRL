@@ -56,15 +56,15 @@ class HighActor(nn.Module):
         return mean, log_std
 
 class Value(nn.Module):
-    """Value function V(s)."""
+    """Value function Q(s, a)."""
 
     layer_sizes: Sequence[int] = (512, 512, 512)
     rep_dim: int = 10
     layer_norm: bool = True
 
     @nn.compact
-    def __call__(self, observation: jnp.ndarray, goal_rep: jnp.ndarray):
-        x = jnp.concatenate([observation, goal_rep], axis=-1)
+    def __call__(self, observation: jnp.ndarray, goal_rep: jnp.ndarray, action: jnp.ndarray):
+        x = jnp.concatenate([observation, goal_rep, action], axis=-1)
         x = MLP(
             layer_sizes=list(self.layer_sizes) + [1],
             activate_final=False,
