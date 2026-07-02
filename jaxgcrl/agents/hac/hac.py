@@ -12,6 +12,7 @@ from brax.training.acme import running_statistics
 from flax import nnx
 from flax.struct import dataclass
 
+from jaxgcrl.agents.planner import PlannerMode, validate_planner_config
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 
 Metrics = types.Metrics
@@ -60,6 +61,9 @@ class HAC:
     # exploration
     random_action_epsilon: float = 0.2
     random_action_noise: float = 0.1
+    planner_mode: PlannerMode = "none"
+    planner_step_size: float = 2.0
+    disable_high_actor_update_with_planner: bool = False
 
 
 def train_fn(
@@ -122,6 +126,12 @@ def train_fn(
 
     obs_size = unwrapped_env.observation_size
     action_size = unwrapped_env.action_size
+    goal_indices = tuple(int(x) for x in getattr(unwrapped_env, "goal_indices", (0, 1)))
+    validate_planner_config(
+        self.planner_mode,
+        goal_indices=goal_indices,
+        goal_size=len(goal_indices),
+    )
 
     hac_agent, replay_buffers = make_networks_and_buffers(
         hac_config=self,

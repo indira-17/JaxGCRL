@@ -11,7 +11,7 @@ import logging
 import pickle
 import random
 import time
-from typing import Any, Callable, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, Dict, NamedTuple, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
@@ -29,6 +29,7 @@ from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
+from jaxgcrl.agents.planner import PlannerMode, oracle_subgoal, planner_metrics, validate_planner_config
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
@@ -93,6 +94,78 @@ def save_params(path: str, params: Any):
         fout.write(pickle.dumps(params))
 
 
+def make_replay_snapshot_metadata(
+    *,
+    env_name: str,
+    obs_size: int,
+    action_size: int,
+    num_envs: int,
+    episode_length: int,
+    subgoal_steps: int,
+    goal_indices: Tuple[int, ...],
+    snapshot_step: int,
+) -> Dict[str, Any]:
+    return {
+        "env_name": env_name,
+        "obs_size": int(obs_size),
+        "action_size": int(action_size),
+        "num_envs": int(num_envs),
+        "episode_length": int(episode_length),
+        "subgoal_steps": int(subgoal_steps),
+        "goal_indices": tuple(int(x) for x in goal_indices),
+        "snapshot_step": int(snapshot_step),
+    }
+
+
+def validate_replay_snapshot_metadata(
+    metadata: Dict[str, Any],
+    *,
+    env_name: str,
+    obs_size: int,
+    action_size: int,
+    num_envs: int,
+    episode_length: int,
+    subgoal_steps: int,
+    goal_indices: Tuple[int, ...],
+) -> None:
+    expected = make_replay_snapshot_metadata(
+        env_name=env_name,
+        obs_size=obs_size,
+        action_size=action_size,
+        num_envs=num_envs,
+        episode_length=episode_length,
+        subgoal_steps=subgoal_steps,
+        goal_indices=goal_indices,
+        snapshot_step=int(metadata.get("snapshot_step", 0)),
+    )
+    for key, expected_value in expected.items():
+        if key == "snapshot_step":
+            continue
+        actual_value = metadata.get(key)
+        if key == "goal_indices" and actual_value is not None:
+            actual_value = tuple(int(x) for x in actual_value)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"Replay snapshot metadata mismatch for {key}: "
+                f"expected {expected_value}, got {actual_value}"
+            )
+
+
+def save_replay_snapshot(path: str, buffer_state: Any, metadata: Dict[str, Any]) -> None:
+    path = epath.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as fout:
+        fout.write(pickle.dumps({"buffer_state": buffer_state, "metadata": metadata}))
+
+
+def load_replay_snapshot(path: str) -> Tuple[Any, Dict[str, Any]]:
+    with epath.Path(path).open("rb") as fin:
+        snapshot = pickle.loads(fin.read())
+    if "buffer_state" not in snapshot or "metadata" not in snapshot:
+        raise ValueError(f"Invalid replay snapshot at {path}: expected buffer_state and metadata")
+    return snapshot["buffer_state"], snapshot["metadata"]
+
+
 def _pack_params(training_state: TrainingState):
     return {
         "actor": training_state.actor_state.params,
@@ -108,6 +181,15 @@ class HCARL:
     high_actor_hidden: Tuple[int, ...] = (512, 512, 512)
     value_hidden: Tuple[int, ...] = (512, 512, 512)
     flat_policy: bool = False
+    use_split_values: bool = True
+    planner_mode: PlannerMode = "none"
+    planner_step_size: float = 2.0
+    disable_high_actor_update_with_planner: bool = False
+
+    replay_snapshot_path: Optional[str] = None
+    save_replay_snapshot_path: Optional[str] = None
+    random_snapshot_steps: int = 0
+    offline_update_steps: int = 0
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -178,6 +260,8 @@ class HCARL:
 
         logging.info("HCARL flat_policy: %s", self.flat_policy)
         logging.info("HCARL log_state_coverage: %s", self.log_state_coverage)
+        logging.info("HCARL use_split_values: %s", self.use_split_values)
+        logging.info("HCARL planner_mode: %s", self.planner_mode)
 
         unwrapped_env = train_env
         train_env = TrajectoryIdWrapper(train_env)
@@ -196,14 +280,24 @@ class HCARL:
         )
 
         env_steps_per_actor_step = config.num_envs * self.unroll_length
-        num_prefill_env_steps = self.min_replay_size * config.num_envs
         num_prefill_actor_steps = int(np.ceil(self.min_replay_size / self.unroll_length))
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
-            config.num_evals * env_steps_per_actor_step
+        random_snapshot_actor_steps = int(
+            np.ceil(max(0, self.random_snapshot_steps) / env_steps_per_actor_step)
+        )
+        initial_actor_steps = (
+            random_snapshot_actor_steps if random_snapshot_actor_steps > 0
+            else 0 if self.replay_snapshot_path is not None
+            else num_prefill_actor_steps
+        )
+        initial_env_steps = initial_actor_steps * env_steps_per_actor_step
+        remaining_env_steps = max(1, config.total_env_steps - initial_env_steps)
+        num_training_steps_per_epoch = int(
+            np.ceil(remaining_env_steps / (config.num_evals * env_steps_per_actor_step))
         )
         assert num_training_steps_per_epoch > 0, "total_env_steps too small for this setup"
 
         logging.info("num_prefill_actor_steps: %d", num_prefill_actor_steps)
+        logging.info("random_snapshot_actor_steps: %d", random_snapshot_actor_steps)
         logging.info("num_training_steps_per_epoch: %d", num_training_steps_per_epoch)
 
         random.seed(config.seed)
@@ -213,7 +307,7 @@ class HCARL:
 
         # Keep CRL component keys together. The high key is split after those so
         # adding hierarchy perturbs CRL initialization as little as possible.
-        key, sg_key, a_key, actor_key, high_key, value_key = jax.random.split(key, 6)
+        key, sg_key, a_key, actor_key, high_key, value_low_key, value_high_key = jax.random.split(key, 7)
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -224,6 +318,11 @@ class HCARL:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size
+        validate_planner_config(
+            self.planner_mode,
+            goal_indices=tuple(np.asarray(train_env.goal_indices)),
+            goal_size=goal_size,
+        )
         target_entropy = -self.target_entropy_scale * action_size
 
         # State coverage tracking.
@@ -277,21 +376,27 @@ class HCARL:
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
-        value_module = Value(
+        value_low_module = Value(
+            layer_sizes=self.value_hidden,
+            use_ln=self.use_ln,
+        )
+        value_high_module = Value(
             layer_sizes=self.value_hidden,
             use_ln=self.use_ln,
         )
         networks = {
             "sg_encoder": sg_encoder_module,
             "a_encoder": a_encoder_module,
-            "value_module": value_module,
+            "value_low_module": value_low_module,
+            "value_high_module": value_high_module,
             "actor": actor_module,
             "high_actor": high_actor_module,
         }
 
         dummy_state = jnp.ones((1, state_size))
         dummy_goal = jnp.ones((1, goal_size))
-        # CARL action encoder receives the fixed-length action sequence (a_t, ..., a_{t+k-1}), flattened into one vector.
+        # CARL action encoder receives the fixed-length action sequence
+        # (a_t, ..., a_{t+k-1}), flattened into one vector.
         dummy_action = jnp.ones((1, action_size * self.subgoal_steps))
         dummy_obs = jnp.ones((1, obs_size))
         dummy_sg = jnp.concatenate([dummy_state, dummy_goal], axis=-1)
@@ -304,14 +409,16 @@ class HCARL:
         dummy_actor_obs = jnp.ones((1, state_size + self.repr_dim))
         actor_params = actor_module.init(actor_key, dummy_actor_obs)
         high_params = high_actor_module.init(high_key, dummy_obs)
-        value_params = value_module.init(value_key, dummy_state, dummy_rep)
+        value_low_params = value_low_module.init(value_low_key, dummy_state, dummy_rep)
+        value_high_params = value_high_module.init(value_high_key, dummy_state, dummy_goal)
 
         critic_state = TrainState.create(
             apply_fn=None,
             params={
                 "sg_encoder": sg_params,
                 "a_encoder": a_params,
-                "value1": value_params,
+                "value_low": value_low_params,
+                "value_high": value_high_params,
             },
             tx=optax.adam(learning_rate=self.critic_lr),
         )
@@ -383,6 +490,7 @@ class HCARL:
             high_actor_beta=self.high_actor_beta,
             high_actor_max_weight=self.high_actor_max_weight,
             stop_value_encoder_grad=self.stop_value_encoder_grad,
+            use_split_values=self.use_split_values,
             p_randomgoal=self.p_randomgoal,
             p_trajgoal=self.p_trajgoal,
             p_currgoal=self.p_currgoal,
@@ -396,8 +504,11 @@ class HCARL:
         _discount = float(self.discount)
         _state_size = int(state_size)
         _goal_indices_arr = jnp.array(train_env.goal_indices)
+        _goal_indices_tuple = tuple(int(x) for x in np.asarray(train_env.goal_indices))
         _subgoal_steps = int(self.subgoal_steps)
         _flat_policy = bool(self.flat_policy)
+        _use_planner = self.planner_mode != "none"
+        _env_name = str(getattr(config, "env", "unknown"))
 
         def flatten_batch_hcrl(transition, sample_key):
             """HIQL GCSDataset-style sampling, kept close to the original code.
@@ -412,7 +523,8 @@ class HCARL:
             indx = jnp.arange(seq_len)
             traj_ids = transition.extras["state_extras"]["traj_id"]
 
-            # Equivalent of terminal_locs[searchsorted(terminal_locs, indx)] inside this sampled trajectory chunk.
+            # Equivalent of terminal_locs[searchsorted(...)] inside this
+            # sampled trajectory chunk.
             same_traj = jnp.equal(traj_ids[:, None], traj_ids[None, :])
             future_or_self = indx[None, :] >= indx[:, None]
             final_indx = jnp.max(
@@ -450,7 +562,9 @@ class HCARL:
                 )
                 return goal_indx
 
-            goal_key, high_traj_key, high_random_key, high_pick_key = jax.random.split(sample_key, 4)
+            goal_key, high_value_key, high_traj_key, high_random_key, high_pick_key = jax.random.split(
+                sample_key, 5
+            )
 
             # Same as GCDataset.sample(): sample relabelled goals and recompute reward/mask.
             goal_indx = sample_goals(
@@ -463,6 +577,23 @@ class HCARL:
             reward = success * float(self.reward_scale) + float(self.reward_shift)
             mask = jnp.where(bool(self.terminal), 1.0 - success, jnp.ones_like(success))
             goals = jnp.take(transition.observation, goal_indx, axis=0)[:, _goal_indices_arr]
+
+            high_value_goal_indx = sample_goals(
+                high_value_key,
+                float(self.p_randomgoal),
+                float(self.p_trajgoal),
+                float(self.p_currgoal),
+            )
+            high_value_success = (high_value_goal_indx == indx).astype(jnp.float32)
+            high_value_reward = (
+                high_value_success * float(self.reward_scale) + float(self.reward_shift)
+            )
+            high_value_mask = jnp.where(
+                bool(self.terminal), 1.0 - high_value_success, jnp.ones_like(high_value_success)
+            )
+            high_value_goals = jnp.take(
+                transition.observation, high_value_goal_indx, axis=0
+            )[:, _goal_indices_arr]
 
             # Same as GCSDataset.sample(): low_goals = s_{t+k}.
             way_indx = jnp.minimum(indx + _subgoal_steps, final_indx)
@@ -488,6 +619,10 @@ class HCARL:
             high_goals = jnp.take(transition.observation, high_goal_indx, axis=0)[:, _goal_indices_arr]
             high_targets_full = jnp.take(transition.observation, high_target_indx, axis=0)
             high_targets = high_targets_full[:, _goal_indices_arr]
+
+            low_success = (way_indx == indx).astype(jnp.float32)
+            low_reward = low_success * float(self.reward_scale) + float(self.reward_shift)
+            low_mask = jnp.where(bool(self.terminal), 1.0 - low_success, jnp.ones_like(low_success))
 
             state = transition.observation[:-1, :_state_size]
             next_state = transition.observation[1:, :_state_size]
@@ -516,13 +651,21 @@ class HCARL:
                     "next_state": next_state,
                     "state": state,
                     "value_goal": goals[:-1],
+                    "low_value_goal": low_goals[:-1],
+                    "low_value_reward": low_reward[:-1],
+                    "low_value_discount": low_mask[:-1] * transition.discount[:-1],
                     "low_actor_goal": low_goals[:-1],
                     "low_actor_state": way_obs[:-1, :_state_size],
                     "action_sequence": action_seq[:-1],
                     "high_actor_goal": high_goals[:-1],
+                    "high_value_goal": high_value_goals[:-1],
+                    "high_value_reward": high_value_reward[:-1],
+                    "high_value_discount": high_value_mask[:-1] * transition.discount[:-1],
                     "high_actor_target_goal": high_targets[:-1],
                     "high_actor_target_state": high_targets_full[:-1, :_state_size],
                     "hiql_value_goal_success": success[:-1],
+                    "low_value_goal_success": low_success[:-1],
+                    "high_value_goal_success": high_value_success[:-1],
                     "hiql_pick_random_high_goal": pick_random[:-1].astype(jnp.float32),
                 },
             )
@@ -533,6 +676,18 @@ class HCARL:
                 actor_goal = sg_encoder_module.apply(
                     params["sg_encoder"],
                     jnp.concatenate([state, goal], axis=-1),
+                )
+            elif _use_planner:
+                raw_subgoal = oracle_subgoal(
+                    state,
+                    goal,
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                actor_goal = sg_encoder_module.apply(
+                    params["sg_encoder"],
+                    jnp.concatenate([state, raw_subgoal], axis=-1),
                 )
             else:
                 high_key, key = jax.random.split(key)
@@ -610,6 +765,36 @@ class HCARL:
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
 
+        @jax.jit
+        def get_random_experience(env_state, buffer_state, key):
+            @jax.jit
+            def f(carry, unused_t):
+                env_state, current_key = carry
+                action_key, next_key = jax.random.split(current_key)
+                actions = jax.random.uniform(
+                    action_key,
+                    shape=(config.num_envs, action_size),
+                    minval=-1.0,
+                    maxval=1.0,
+                )
+                nstate = train_env.step(env_state, actions)
+                state_extras = {x: nstate.info[x] for x in ("truncation", "traj_id")}
+                transition = Transition(
+                    observation=env_state.obs,
+                    action=actions,
+                    reward=nstate.reward,
+                    discount=1 - nstate.done,
+                    extras={"state_extras": state_extras},
+                )
+                return (nstate, next_key), transition
+
+            (env_state, _), data = jax.lax.scan(
+                f, (env_state, key), (), length=self.unroll_length
+            )
+            buffer_state = replay_buffer.insert(buffer_state, data)
+            action_abs_mean = jnp.mean(jnp.abs(data.action))
+            return env_state, buffer_state, action_abs_mean
+
         def prefill_replay_buffer(training_state, env_state, buffer_state, key):
             @jax.jit
             def f(carry, unused):
@@ -631,6 +816,33 @@ class HCARL:
                 length=num_prefill_actor_steps,
             )[0]
 
+        def collect_random_snapshot(training_state, env_state, buffer_state, key):
+            @jax.jit
+            def f(carry, unused):
+                del unused
+                training_state, env_state, buffer_state, key = carry
+                key, step_key = jax.random.split(key)
+                env_state, buffer_state, action_abs_mean = get_random_experience(
+                    env_state, buffer_state, step_key
+                )
+                training_state = training_state.replace(
+                    env_steps=training_state.env_steps + env_steps_per_actor_step,
+                )
+                return (training_state, env_state, buffer_state, key), action_abs_mean
+
+            (training_state, env_state, buffer_state, key), action_abs_mean = jax.lax.scan(
+                f,
+                (training_state, env_state, buffer_state, key),
+                (),
+                length=random_snapshot_actor_steps,
+            )
+            metrics = {
+                "random_snapshot/action_abs_mean": jnp.asarray(action_abs_mean).mean(),
+                "random_snapshot/buffer_size": replay_buffer.size(buffer_state),
+                "random_snapshot/env_steps": training_state.env_steps,
+            }
+            return training_state, env_state, buffer_state, key, metrics
+
         @jax.jit
         def update_networks(carry, batch):
             training_state, key = carry
@@ -643,7 +855,7 @@ class HCARL:
                 crl_config, networks, batch, training_state, actor_key
             )
 
-            if _flat_policy:
+            if _flat_policy or (_use_planner and self.disable_high_actor_update_with_planner):
                 high_actor_metrics = {
                     "high_actor_loss": jnp.array(0.0),
                     "high_actor_log_prob": jnp.array(0.0),
@@ -653,12 +865,31 @@ class HCARL:
                     "high_actor_adv": jnp.array(0.0),
                     "high_actor_v_curr": jnp.array(0.0),
                     "high_actor_v_next": jnp.array(0.0),
-                    "high_log_std_mean": jnp.array(0.0),
-                    "high_latent_noise_mean": jnp.array(0.0),
+                    "high_actor_log_std_mean": jnp.array(0.0),
+                    "high_actor_latent_noise_mean": jnp.array(0.0),
                 }
             else:
                 training_state, high_actor_metrics = update_high_actor(
                     crl_config, networks, batch, training_state, high_actor_key
+                )
+            if _use_planner:
+                state = batch.extras["state"]
+                final_goal = batch.extras["high_actor_goal"]
+                subgoal = oracle_subgoal(
+                    state,
+                    final_goal,
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                high_actor_metrics.update(
+                    planner_metrics(
+                        state,
+                        final_goal,
+                        subgoal,
+                        _goal_indices_tuple,
+                        self.planner_step_size,
+                    )
                 )
 
             training_state = training_state.replace(
@@ -671,16 +902,7 @@ class HCARL:
             metrics["gradient_steps"] = training_state.gradient_steps
             return (training_state, key), metrics
 
-        @jax.jit
-        def training_step(training_state, env_state, buffer_state, key):
-            experience_key, permute_key, sampling_key, training_key = jax.random.split(key, 4)
-            env_state, buffer_state = get_experience(
-                training_state, env_state, buffer_state, experience_key
-            )
-            training_state = training_state.replace(
-                env_steps=training_state.env_steps + env_steps_per_actor_step,
-            )
-
+        def sample_training_batches(buffer_state, permute_key, sampling_key):
             buffer_state, transitions = replay_buffer.sample(buffer_state)
             batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
             batches = jax.vmap(flatten_batch_hcrl)(transitions, batch_keys)
@@ -695,8 +917,59 @@ class HCARL:
                 lambda x: jnp.reshape(x, (num_updates, self.batch_size) + x.shape[1:]),
                 batches,
             )
+            return buffer_state, batches
+
+        @jax.jit
+        def replay_update_step(training_state, buffer_state, key):
+            permute_key, sampling_key, training_key = jax.random.split(key, 3)
+            buffer_state, batches = sample_training_batches(buffer_state, permute_key, sampling_key)
             (training_state, _), metrics = jax.lax.scan(
                 update_networks, (training_state, training_key), batches
+            )
+            return training_state, buffer_state, metrics
+
+        @jax.jit
+        def offline_update_step(training_state, buffer_state, key):
+            permute_key, sampling_key, training_key = jax.random.split(key, 3)
+            buffer_state, batches = sample_training_batches(buffer_state, permute_key, sampling_key)
+            batch = jax.tree_util.tree_map(lambda x: x[0], batches)
+            (training_state, _), metrics = update_networks(
+                (training_state, training_key), batch
+            )
+            metrics["offline_updates"] = training_state.gradient_steps
+            return training_state, buffer_state, metrics
+
+        @jax.jit
+        def run_offline_updates(training_state, buffer_state, key):
+            def f(carry, unused):
+                del unused
+                training_state, buffer_state, key = carry
+                key, update_key = jax.random.split(key)
+                training_state, buffer_state, metrics = offline_update_step(
+                    training_state, buffer_state, update_key
+                )
+                return (training_state, buffer_state, key), metrics
+
+            (training_state, buffer_state, key), metrics = jax.lax.scan(
+                f,
+                (training_state, buffer_state, key),
+                (),
+                length=self.offline_update_steps,
+            )
+            metrics = jax.tree_util.tree_map(lambda x: jnp.asarray(x).mean(), metrics)
+            return training_state, buffer_state, key, metrics
+
+        @jax.jit
+        def training_step(training_state, env_state, buffer_state, key):
+            experience_key, training_key = jax.random.split(key, 2)
+            env_state, buffer_state = get_experience(
+                training_state, env_state, buffer_state, experience_key
+            )
+            training_state = training_state.replace(
+                env_steps=training_state.env_steps + env_steps_per_actor_step,
+            )
+            training_state, buffer_state, metrics = replay_update_step(
+                training_state, buffer_state, training_key
             )
             return (training_state, env_state, buffer_state), metrics
 
@@ -720,10 +993,91 @@ class HCARL:
             epoch_metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
             return training_state, env_state, buffer_state, epoch_metrics
 
-        key, prefill_key = jax.random.split(key, 2)
-        training_state, env_state, buffer_state, _ = prefill_replay_buffer(
-            training_state, env_state, buffer_state, prefill_key
-        )
+        startup_metrics = {
+            "training/replay_loaded": 0.0,
+            "training/offline_updates": 0.0,
+        }
+        loaded_or_collected_replay = False
+
+        if self.replay_snapshot_path is not None:
+            loaded_buffer_state, snapshot_metadata = load_replay_snapshot(self.replay_snapshot_path)
+            validate_replay_snapshot_metadata(
+                snapshot_metadata,
+                env_name=_env_name,
+                obs_size=obs_size,
+                action_size=action_size,
+                num_envs=config.num_envs,
+                episode_length=config.episode_length,
+                subgoal_steps=self.subgoal_steps,
+                goal_indices=_goal_indices_tuple,
+            )
+            buffer_state = loaded_buffer_state
+            loaded_or_collected_replay = True
+            startup_metrics["training/replay_loaded"] = 1.0
+            logging.info("loaded replay snapshot from %s", self.replay_snapshot_path)
+
+        if random_snapshot_actor_steps > 0:
+            key, random_snapshot_key = jax.random.split(key, 2)
+            training_state, env_state, buffer_state, key, random_snapshot_metrics = (
+                collect_random_snapshot(
+                    training_state,
+                    env_state,
+                    buffer_state,
+                    random_snapshot_key,
+                )
+            )
+            loaded_or_collected_replay = True
+            random_snapshot_metrics = jax.tree_util.tree_map(
+                lambda x: float(jnp.asarray(x).block_until_ready()),
+                random_snapshot_metrics,
+            )
+            startup_metrics.update(random_snapshot_metrics)
+            logging.info(
+                "collected random replay snapshot with %d env steps",
+                int(training_state.env_steps.item()),
+            )
+
+        if not loaded_or_collected_replay:
+            key, prefill_key = jax.random.split(key, 2)
+            training_state, env_state, buffer_state, _ = prefill_replay_buffer(
+                training_state, env_state, buffer_state, prefill_key
+            )
+
+        if self.save_replay_snapshot_path is not None:
+            snapshot_metadata = make_replay_snapshot_metadata(
+                env_name=_env_name,
+                obs_size=obs_size,
+                action_size=action_size,
+                num_envs=config.num_envs,
+                episode_length=config.episode_length,
+                subgoal_steps=self.subgoal_steps,
+                goal_indices=_goal_indices_tuple,
+                snapshot_step=int(training_state.env_steps.item()),
+            )
+            save_replay_snapshot(self.save_replay_snapshot_path, buffer_state, snapshot_metadata)
+            startup_metrics["random_snapshot/snapshot_saved"] = 1.0
+            logging.info("saved replay snapshot to %s", self.save_replay_snapshot_path)
+
+        if int(jax.device_get(replay_buffer.size(buffer_state))) < config.episode_length:
+            raise ValueError(
+                "HCARL replay buffer does not contain enough data to sample one trajectory: "
+                f"size={int(jax.device_get(replay_buffer.size(buffer_state)))}, "
+                f"episode_length={config.episode_length}"
+            )
+
+        if self.offline_update_steps > 0:
+            key, offline_key = jax.random.split(key, 2)
+            training_state, buffer_state, key, offline_metrics = run_offline_updates(
+                training_state, buffer_state, offline_key
+            )
+            startup_metrics["training/offline_updates"] = float(self.offline_update_steps)
+            startup_metrics.update(
+                {
+                    f"training/offline_{name}": float(jnp.asarray(value).block_until_ready())
+                    for name, value in offline_metrics.items()
+                }
+            )
+            logging.info("completed %d offline replay updates", self.offline_update_steps)
 
         evaluator = ActorEvaluator(
             deterministic_actor_step,
@@ -741,6 +1095,18 @@ class HCARL:
                     actor_goal = sg_encoder_module.apply(
                         param["sg_encoder"],
                         jnp.concatenate([s, g], axis=-1),
+                    )
+                elif _use_planner:
+                    raw_subgoal = oracle_subgoal(
+                        s,
+                        g,
+                        _goal_indices_tuple,
+                        self.planner_mode,
+                        self.planner_step_size,
+                    )
+                    actor_goal = sg_encoder_module.apply(
+                        param["sg_encoder"],
+                        jnp.concatenate([s, raw_subgoal], axis=-1),
                     )
                 else:
                     high_obs = jnp.concatenate([s, g], axis=-1)
@@ -776,6 +1142,7 @@ class HCARL:
                 "training/sps": float(sps),
                 "training/walltime": float(training_walltime),
                 "training/envsteps": current_step,
+                **startup_metrics,
                 **{f"training/{name}": value for name, value in metrics.items()},
             }
 

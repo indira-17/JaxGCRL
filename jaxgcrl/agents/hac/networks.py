@@ -7,6 +7,7 @@ from brax.training.acme import running_statistics, specs
 from brax.training.networks import ActivationFn, Initializer
 from flax import nnx
 
+from jaxgcrl.agents.planner import oracle_subgoal
 from jaxgcrl.agents.hac.hac import GCTransition, HAC
 from jaxgcrl.utils.replay_buffer_nnx import TrajectoryUniformSamplingQueueNNX
 
@@ -435,6 +436,9 @@ class HACAgent(nnx.Module):
         k_step: int = 25,
         num_levels: int = 2,
         enable_temporal_abstraction: bool = True,
+        planner_mode: str = "none",
+        planner_step_size: float = 2.0,
+        goal_indices: Sequence[int] = (0, 1),
     ):
         if num_levels <= 0:
             raise ValueError(f"num_levels must be positive, got {num_levels}")
@@ -450,6 +454,30 @@ class HACAgent(nnx.Module):
         self._k_step = k_step
         self._num_levels = num_levels
         self._enable_temporal_abstraction = enable_temporal_abstraction
+        self._planner_mode = planner_mode
+        self._planner_step_size = planner_step_size
+        self._goal_indices = tuple(int(x) for x in goal_indices)
+
+    def _top_level_goal(self, observations: jax.Array, goals: jax.Array) -> jax.Array:
+        if self._planner_mode == "none" or self._num_levels == 1:
+            return goals
+
+        if goals.shape[-1] == len(self._goal_indices):
+            final_goal_xy = goals
+        else:
+            final_goal_xy = goals[:, jnp.asarray(self._goal_indices)]
+
+        waypoint = oracle_subgoal(
+            observations,
+            final_goal_xy,
+            self._goal_indices,
+            self._planner_mode,
+            self._planner_step_size,
+        )
+
+        if self.subgoals[0].shape[-1] == waypoint.shape[-1]:
+            return waypoint
+        return observations.at[:, jnp.asarray(self._goal_indices)].set(waypoint)
 
     def reset(self) -> None:
         self.counters[...] = jnp.full_like(self.counters[...], self._k_step)
@@ -465,7 +493,10 @@ class HACAgent(nnx.Module):
         deterministic: bool = False,
     ) -> tuple[types.Action, types.Extra]:
         for level in reversed(range(1, self._num_levels)):
-            conditioned_goal = goals if level == self._num_levels - 1 else self.subgoals[level]
+            conditioned_goal = self._top_level_goal(
+                observations,
+                goals,
+            ) if level == self._num_levels - 1 else self.subgoals[level]
 
             should_refresh_subgoal = not self._enable_temporal_abstraction or jnp.all(self.counters[:level] == self._k_step)
             if level < self._num_levels - 1:

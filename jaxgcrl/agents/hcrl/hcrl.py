@@ -32,6 +32,7 @@ from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
+from jaxgcrl.agents.planner import PlannerMode, oracle_subgoal, planner_metrics, validate_planner_config
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
@@ -41,9 +42,12 @@ from jaxgcrl.agents.crl.networks import Actor, Encoder
 from .losses import (
     _normal_sample,
     _tanh_normal_sample,
+    update_actor_and_alpha_carl,
+    update_carl_aux,
     update_actor_and_alpha,
     update_critic,
     update_high_actor,
+    update_high_actor_carl,
 )
 from .networks import HighActor
 
@@ -60,6 +64,7 @@ class TrainingState:
     critic_state: TrainState
     alpha_state: TrainState
     high_actor_state: TrainState
+    carl_state: TrainState
 
 
 class Transition(NamedTuple):
@@ -87,6 +92,8 @@ def _pack_params(training_state: TrainingState):
         "sa_encoder": training_state.critic_state.params["sa_encoder"],
         "g_encoder": training_state.critic_state.params["g_encoder"],
         "high_actor": training_state.high_actor_state.params,
+        "sg_encoder": training_state.carl_state.params["sg_encoder"],
+        "a_encoder": training_state.carl_state.params["a_encoder"],
     }
 
 
@@ -97,6 +104,13 @@ class HCRL:
     rep_dim: int = 10
     high_actor_hidden: Tuple[int, ...] = (512, 512, 512)
     flat_policy: bool = False
+    planner_mode: PlannerMode = "none"
+    planner_step_size: float = 2.0
+    disable_high_actor_update_with_planner: bool = False
+    use_carl_actor: bool = False
+    carl_lr: float = 3e-4
+    carl_repr_dim: int = 64
+    carl_actor_encoder_grad: bool = False
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -115,6 +129,8 @@ class HCRL:
 
     max_replay_size: int = 10000
     min_replay_size: int = 1000
+    recent_replay_fraction: float = 0.0
+    recent_replay_window: int = 0
     unroll_length: int = 62
     h_dim: int = 256
     n_hidden: int = 2
@@ -138,6 +154,14 @@ class HCRL:
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
+        if not 0.0 <= self.recent_replay_fraction <= 1.0:
+            raise ValueError(
+                f"recent_replay_fraction must be in [0, 1], got {self.recent_replay_fraction}"
+            )
+        if self.recent_replay_window < 0:
+            raise ValueError(
+                f"recent_replay_window must be non-negative, got {self.recent_replay_window}"
+            )
 
     def train_fn(
         self,
@@ -153,6 +177,8 @@ class HCRL:
         self.check_config(config)
 
         logging.info("HCRL flat_policy: %s", self.flat_policy)
+        logging.info("HCRL use_carl_actor: %s", self.use_carl_actor)
+        logging.info("HCRL planner_mode: %s", self.planner_mode)
         logging.info("HCRL log_state_coverage: %s", self.log_state_coverage)
 
         unwrapped_env = train_env
@@ -174,8 +200,11 @@ class HCRL:
         env_steps_per_actor_step = config.num_envs * self.unroll_length
         num_prefill_env_steps = self.min_replay_size * config.num_envs
         num_prefill_actor_steps = int(np.ceil(self.min_replay_size / self.unroll_length))
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
-            config.num_evals * env_steps_per_actor_step
+        num_training_steps_per_epoch = int(
+            np.ceil(
+                (config.total_env_steps - num_prefill_env_steps)
+                / (config.num_evals * env_steps_per_actor_step)
+            )
         )
         assert num_training_steps_per_epoch > 0, "total_env_steps too small for this setup"
 
@@ -190,7 +219,7 @@ class HCRL:
         # Keep CRL component keys together. The high key is split after those so
         # adding hierarchy perturbs CRL initialization as little as possible.
         key, sa_key, g_key, actor_key = jax.random.split(key, 4)
-        key, high_key = jax.random.split(key)
+        key, high_key, sg_key, a_key = jax.random.split(key, 4)
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -201,6 +230,11 @@ class HCRL:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size
+        validate_planner_config(
+            self.planner_mode,
+            goal_indices=tuple(np.asarray(train_env.goal_indices)),
+            goal_size=goal_size,
+        )
         target_entropy = -0.5 * action_size
 
         # State coverage tracking.
@@ -246,31 +280,55 @@ class HCRL:
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
+        actor_input_size = state_size + (self.carl_repr_dim if self.use_carl_actor else goal_size)
+        high_actor_output_size = self.carl_repr_dim if self.use_carl_actor else goal_size
         high_actor_module = Actor(
-            action_size=goal_size,
+            action_size=high_actor_output_size,
             network_width=self.h_dim,
             network_depth=self.n_hidden,
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
+        )
+        sg_encoder_module = Encoder(
+            repr_dim=self.carl_repr_dim,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            skip_connections=self.skip_connections,
+            use_relu=self.use_relu,
+            use_ln=self.use_ln,
+        )
+        a_encoder_module = Encoder(
+            repr_dim=self.carl_repr_dim,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            skip_connections=self.skip_connections,
+            use_relu=self.use_relu,
+            use_ln=self.use_ln,
         )
         networks = {
             "sa_encoder": sa_encoder_module,
             "g_encoder": g_encoder_module,
             "actor": actor_module,
             "high_actor": high_actor_module,
+            "sg_encoder": sg_encoder_module,
+            "a_encoder": a_encoder_module,
         }
 
         dummy_state = jnp.ones((1, state_size))
         dummy_goal = jnp.ones((1, goal_size))
         dummy_action = jnp.ones((1, action_size))
-        dummy_obs = jnp.ones((1, obs_size))
+        dummy_actor_obs = jnp.ones((1, actor_input_size))
         dummy_sa = jnp.concatenate([dummy_state, dummy_action], axis=-1)
         dummy_high_obs = jnp.concatenate([dummy_state, dummy_goal], axis=-1)
+        dummy_sg_obs = jnp.concatenate([dummy_state, dummy_goal], axis=-1)
+        dummy_action_sequence = jnp.ones((1, self.subgoal_steps * action_size))
 
         sa_params = sa_encoder_module.init(sa_key, dummy_sa)
         g_params = g_encoder_module.init(g_key, dummy_goal)
-        actor_params = actor_module.init(actor_key, dummy_obs)
+        actor_params = actor_module.init(actor_key, dummy_actor_obs)
         high_params = high_actor_module.init(high_key, dummy_high_obs)
+        sg_params = sg_encoder_module.init(sg_key, dummy_sg_obs)
+        a_params = a_encoder_module.init(a_key, dummy_action_sequence)
 
         critic_state = TrainState.create(
             apply_fn=None,
@@ -292,6 +350,11 @@ class HCRL:
             params={"log_alpha": jnp.array(0.0)},
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
+        carl_state = TrainState.create(
+            apply_fn=None,
+            params={"sg_encoder": sg_params, "a_encoder": a_params},
+            tx=optax.adam(learning_rate=self.carl_lr),
+        )
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
@@ -299,6 +362,7 @@ class HCRL:
             critic_state=critic_state,
             alpha_state=alpha_state,
             high_actor_state=high_actor_state,
+            carl_state=carl_state,
         )
 
         dummy_transition = Transition(
@@ -324,6 +388,52 @@ class HCRL:
             )
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
+        _use_recent_replay = self.recent_replay_fraction > 0.0 and self.recent_replay_window > 0
+        _recent_replay_fraction = float(self.recent_replay_fraction)
+        _recent_replay_window = int(self.recent_replay_window)
+
+        def sample_replay_buffer(buffer_state):
+            if not _use_recent_replay:
+                return replay_buffer.sample(buffer_state)
+
+            key, env_key, full_key, recent_key, mix_key = jax.random.split(buffer_state.key, 5)
+            envs_idxs = jax.random.choice(
+                env_key,
+                jnp.arange(replay_buffer.num_envs),
+                shape=(replay_buffer.num_envs,),
+                replace=False,
+            )
+            max_start = buffer_state.insert_position - replay_buffer.episode_length
+            min_start = buffer_state.sample_position
+            recent_min_start = jnp.maximum(min_start, max_start - _recent_replay_window)
+            full_starts = jax.random.randint(
+                full_key,
+                shape=(replay_buffer.num_envs,),
+                minval=min_start,
+                maxval=max_start,
+            )
+            recent_starts = jax.random.randint(
+                recent_key,
+                shape=(replay_buffer.num_envs,),
+                minval=recent_min_start,
+                maxval=max_start,
+            )
+            use_recent = (
+                jax.random.uniform(mix_key, shape=(replay_buffer.num_envs,))
+                < _recent_replay_fraction
+            )
+            start_values = jnp.where(use_recent, recent_starts, full_starts)
+            matrix = start_values[:, jnp.newaxis] + jnp.arange(replay_buffer.episode_length)
+
+            def create_batch(arr_2d, indices):
+                return jnp.take(arr_2d, indices, axis=0, mode="wrap")
+
+            batch = jax.vmap(create_batch, in_axes=(1, 0))(
+                buffer_state.data[:, envs_idxs, :],
+                matrix,
+            )
+            transitions = replay_buffer._unflatten_fn(batch)
+            return buffer_state.replace(key=key), transitions
 
         crl_config = dict(
             discount=self.discount,
@@ -333,13 +443,16 @@ class HCRL:
             contrastive_loss_fn=self.contrastive_loss_fn,
             energy_fn=self.energy_fn,
             logsumexp_penalty_coeff=self.logsumexp_penalty_coeff,
+            carl_actor_encoder_grad=self.carl_actor_encoder_grad,
         )
 
         _discount = float(self.discount)
         _state_size = int(state_size)
         _goal_indices_arr = jnp.array(train_env.goal_indices)
+        _goal_indices_tuple = tuple(int(x) for x in np.asarray(train_env.goal_indices))
         _subgoal_steps = int(self.subgoal_steps)
         _flat_policy = bool(self.flat_policy)
+        _use_planner = self.planner_mode != "none"
 
         def flatten_batch_hcrl(transition, sample_key):
             """Original CRL future-goal relabeling plus optional hierarchy.
@@ -395,6 +508,23 @@ class HCRL:
             # Extra high-actor targets. These are ignored in flat mode.
             high_goal_full = jnp.take(transition.observation, future_goal_idx[:-1], axis=0)
             high_target_full = jnp.take(transition.observation, waypoint_idx[:-1], axis=0)
+            current_idx = arrangement[:-1]
+            final_idx = jnp.max(
+                jnp.where(
+                    jnp.equal(single_trajectories, single_trajectories.T),
+                    arrangement[None, :],
+                    -1,
+                ),
+                axis=1,
+            )
+            action_offsets = jnp.arange(_subgoal_steps)
+            action_idx = jnp.minimum(
+                current_idx[:, None] + action_offsets[None, :],
+                jnp.maximum(final_idx[:-1, None] - 1, current_idx[:, None]),
+            )
+            action_idx = jnp.minimum(action_idx, seq_len - 2)
+            action_sequence = jnp.take(transition.action, action_idx, axis=0)
+            action_sequence = jnp.reshape(action_sequence, (action_sequence.shape[0], -1))
 
             return Transition(
                 observation=crl_obs,
@@ -406,6 +536,8 @@ class HCRL:
                     "future_state": low_future_state,
                     # Only used by HCRL high actor.
                     "state": state,
+                    "carl_goal": low_goal,
+                    "action_sequence": action_sequence,
                     "high_actor_goal": high_goal_full[:, _goal_indices_arr],
                     "high_actor_target_goal": high_target_full[:, _goal_indices_arr],
                     "high_actor_target_state": high_target_full[:, :_state_size],
@@ -414,7 +546,29 @@ class HCRL:
 
         def _get_action(params, state, goal, key, deterministic):
             if _flat_policy:
-                actor_goal = goal
+                raw_actor_goal = goal
+                if self.use_carl_actor:
+                    actor_goal = sg_encoder_module.apply(
+                        params["sg_encoder"],
+                        jnp.concatenate([state, raw_actor_goal], axis=-1),
+                    )
+                else:
+                    actor_goal = raw_actor_goal
+            elif _use_planner:
+                raw_actor_goal = oracle_subgoal(
+                    state,
+                    goal,
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                if self.use_carl_actor:
+                    actor_goal = sg_encoder_module.apply(
+                        params["sg_encoder"],
+                        jnp.concatenate([state, raw_actor_goal], axis=-1),
+                    )
+                else:
+                    actor_goal = raw_actor_goal
             else:
                 high_key, key = jax.random.split(key)
                 high_obs = jnp.concatenate([state, goal], axis=-1)
@@ -520,11 +674,20 @@ class HCRL:
             training_state, critic_metrics = update_critic(
                 crl_config, networks, batch, training_state, critic_key
             )
-            training_state, actor_metrics = update_actor_and_alpha(
-                crl_config, networks, batch, training_state, actor_key
-            )
+            if self.use_carl_actor:
+                training_state, carl_metrics = update_carl_aux(
+                    crl_config, networks, batch, training_state
+                )
+                training_state, actor_metrics = update_actor_and_alpha_carl(
+                    crl_config, networks, batch, training_state, actor_key
+                )
+            else:
+                carl_metrics = {}
+                training_state, actor_metrics = update_actor_and_alpha(
+                    crl_config, networks, batch, training_state, actor_key
+                )
 
-            if _flat_policy:
+            if _flat_policy or (_use_planner and self.disable_high_actor_update_with_planner):
                 high_actor_metrics = {
                     "high_actor_loss": jnp.array(0.0),
                     "high_actor_log_prob": jnp.array(0.0),
@@ -532,8 +695,32 @@ class HCRL:
                     "high_actor_std": jnp.array(0.0),
                 }
             else:
-                training_state, high_actor_metrics = update_high_actor(
-                    crl_config, networks, batch, training_state, high_actor_key
+                if self.use_carl_actor:
+                    training_state, high_actor_metrics = update_high_actor_carl(
+                        crl_config, networks, batch, training_state, high_actor_key
+                    )
+                else:
+                    training_state, high_actor_metrics = update_high_actor(
+                        crl_config, networks, batch, training_state, high_actor_key
+                    )
+            if _use_planner:
+                state = batch.extras["state"]
+                final_goal = batch.extras["high_actor_goal"]
+                subgoal = oracle_subgoal(
+                    state,
+                    final_goal,
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                high_actor_metrics.update(
+                    planner_metrics(
+                        state,
+                        final_goal,
+                        subgoal,
+                        _goal_indices_tuple,
+                        self.planner_step_size,
+                    )
                 )
 
             training_state = training_state.replace(
@@ -541,6 +728,7 @@ class HCRL:
             )
             metrics = {}
             metrics.update(critic_metrics)
+            metrics.update(carl_metrics)
             metrics.update(actor_metrics)
             metrics.update(high_actor_metrics)
             metrics["gradient_steps"] = training_state.gradient_steps
@@ -556,7 +744,7 @@ class HCRL:
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
             )
 
-            buffer_state, transitions = replay_buffer.sample(buffer_state)
+            buffer_state, transitions = sample_replay_buffer(buffer_state)
             batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
             batches = jax.vmap(flatten_batch_hcrl)(transitions, batch_keys)
             batches = jax.tree_util.tree_map(
@@ -593,6 +781,12 @@ class HCRL:
             epoch_metrics = jax.tree_util.tree_map(lambda x: jnp.asarray(x).mean(), epoch_metrics)
             epoch_metrics = dict(epoch_metrics)
             epoch_metrics["buffer_current_size"] = replay_buffer.size(buffer_state)
+            epoch_metrics["recent_replay_fraction"] = jnp.asarray(
+                _recent_replay_fraction if _use_recent_replay else 0.0
+            )
+            epoch_metrics["recent_replay_window"] = jnp.asarray(
+                _recent_replay_window if _use_recent_replay else 0
+            )
             return training_state, env_state, buffer_state, epoch_metrics
 
         key, prefill_key = jax.random.split(key, 2)
@@ -610,14 +804,43 @@ class HCRL:
 
         def _make_policy(param):
             if _flat_policy:
-                # Match the original CRL make_policy style as closely as possible.
-                return lambda obs, rng: actor_module.apply(param["actor"], obs)
+                if not self.use_carl_actor:
+                    # Match the original CRL make_policy style as closely as possible.
+                    return lambda obs, rng: actor_module.apply(param["actor"], obs)
+
+                def _flat_carl_policy(obs, rng):
+                    s = obs[:, :state_size]
+                    g = obs[:, state_size:]
+                    z = sg_encoder_module.apply(
+                        param["sg_encoder"],
+                        jnp.concatenate([s, g], axis=-1),
+                    )
+                    low_obs = jnp.concatenate([s, z], axis=-1)
+                    return actor_module.apply(param["actor"], low_obs)
+
+                return _flat_carl_policy
 
             def _policy(obs, rng):
                 s = obs[:, :state_size]
                 g = obs[:, state_size:]
-                high_obs = jnp.concatenate([s, g], axis=-1)
-                subgoal_mean, _ = high_actor_module.apply(param["high_actor"], high_obs)
+                if _use_planner:
+                    raw_subgoal_mean = oracle_subgoal(
+                        s,
+                        g,
+                        _goal_indices_tuple,
+                        self.planner_mode,
+                        self.planner_step_size,
+                    )
+                    if self.use_carl_actor:
+                        subgoal_mean = sg_encoder_module.apply(
+                            param["sg_encoder"],
+                            jnp.concatenate([s, raw_subgoal_mean], axis=-1),
+                        )
+                    else:
+                        subgoal_mean = raw_subgoal_mean
+                else:
+                    high_obs = jnp.concatenate([s, g], axis=-1)
+                    subgoal_mean, _ = high_actor_module.apply(param["high_actor"], high_obs)
                 low_obs = jnp.concatenate([s, subgoal_mean], axis=-1)
                 return actor_module.apply(param["actor"], low_obs)
 

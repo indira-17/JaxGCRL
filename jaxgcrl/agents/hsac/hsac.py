@@ -27,6 +27,12 @@ from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
+from jaxgcrl.agents.planner import (
+    PlannerMode,
+    oracle_subgoal,
+    planner_metrics,
+    validate_planner_config,
+)
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
@@ -92,6 +98,9 @@ class HSAC:
     subgoal_steps: int = 25
     rep_dim: int = 10
     flat_policy: bool = False
+    planner_mode: PlannerMode = "none"
+    planner_step_size: float = 2.0
+    disable_high_actor_update_with_planner: bool = False
 
     # target entropy = -target_entropy_scale * action_dim (or rep_dim for high)
     target_entropy_scale: float = 1.0
@@ -139,8 +148,11 @@ class HSAC:
         env_steps_per_actor_step = config.num_envs * self.unroll_length
         num_prefill_env_steps = self.min_replay_size * config.num_envs
         num_prefill_actor_steps = np.ceil(self.min_replay_size / self.unroll_length)
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
-            config.num_evals * env_steps_per_actor_step
+        num_training_steps_per_epoch = int(
+            np.ceil(
+                (config.total_env_steps - num_prefill_env_steps)
+                / (config.num_evals * env_steps_per_actor_step)
+            )
         )
 
         assert num_training_steps_per_epoch > 0
@@ -163,6 +175,11 @@ class HSAC:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size
+        validate_planner_config(
+            self.planner_mode,
+            goal_indices=tuple(np.asarray(train_env.goal_indices)),
+            goal_size=goal_size,
+        )
 
         # State coverage tracking
         # If the env exposes goal_indices we use its first two entries (the agent's x,y in obs)
@@ -300,13 +317,16 @@ class HSAC:
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
         # ===== Config dict for losses =====
+        planner_disables_high_actor = (
+            self.planner_mode != "none" and self.disable_high_actor_update_with_planner
+        )
         hsac_config = dict(
             discount=self.discount,
             tau=self.tau,
             target_entropy_low=target_entropy_low,
             target_entropy_high=target_entropy_high,
             goal_indices=tuple(train_env.goal_indices),
-            flat_policy=self.flat_policy,
+            flat_policy=self.flat_policy or planner_disables_high_actor,
         )
 
         # Closed-over constants for goal relabeling
@@ -318,6 +338,8 @@ class HSAC:
         _value_p_trajgoal = float(self.value_p_trajgoal)
         _value_geom_sample = bool(self.value_geom_sample)
         _flat_policy = bool(self.flat_policy)
+        _goal_indices_tuple = tuple(int(x) for x in np.asarray(train_env.goal_indices))
+        _use_planner = self.planner_mode != "none"
 
         def flatten_batch_hsac(transition, sample_key):
             """Relabel a trajectory segment into an HSAC training batch.
@@ -417,6 +439,15 @@ class HSAC:
             """Hierarchical action selection using SAC actors."""
             if _flat:
                 phi = goal_rep_module.apply(params["goal_rep"], state, goal)
+            elif _use_planner:
+                raw_subgoal = oracle_subgoal(
+                    state,
+                    goal,
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                phi = goal_rep_module.apply(params["goal_rep"], state, raw_subgoal)
             else:
                 high_key, key = jax.random.split(key)
                 z_mean, z_log_std = high_actor_module.apply(params["high_actor"], state, goal)
@@ -520,6 +551,23 @@ class HSAC:
             training_state, metrics = update_hsac(
                 hsac_config, networks, batch, training_state, update_key
             )
+            if _use_planner:
+                planner_subgoal = oracle_subgoal(
+                    batch["observations"],
+                    batch["high_actor_goals"],
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                metrics.update(
+                    planner_metrics(
+                        batch["observations"],
+                        batch["high_actor_goals"],
+                        planner_subgoal,
+                        _goal_indices_tuple,
+                        self.planner_step_size,
+                    )
+                )
             return (training_state, key), metrics
 
         @jax.jit
@@ -634,6 +682,15 @@ class HSAC:
                     g = obs[:, state_size:]
                     if _flat:
                         phi = goal_rep_module.apply(param["goal_rep"], s, g)
+                    elif _use_planner:
+                        raw_subgoal = oracle_subgoal(
+                            s,
+                            g,
+                            _goal_indices_tuple,
+                            self.planner_mode,
+                            self.planner_step_size,
+                        )
+                        phi = goal_rep_module.apply(param["goal_rep"], s, raw_subgoal)
                     else:
                         z_mean, _ = high_actor_module.apply(param["high_actor"], s, g)
                         phi = z_mean

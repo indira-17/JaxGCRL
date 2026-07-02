@@ -24,7 +24,7 @@ from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from .losses import update_actor_and_alpha, update_critic
+from .losses import update_actor_and_alpha, update_carl_aux, update_critic
 from .networks import Actor, Encoder
 
 Metrics = types.Metrics
@@ -41,6 +41,7 @@ class TrainingState:
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
+    carl_state: TrainState
 
 
 class Transition(NamedTuple):
@@ -55,7 +56,7 @@ class Transition(NamedTuple):
 
 @functools.partial(jax.jit, static_argnames=("buffer_config"))
 def flatten_batch(buffer_config, transition, sample_key):
-    gamma, state_size, goal_indices = buffer_config
+    gamma, state_size, goal_indices, carl_subgoal_steps = buffer_config
 
     # Because it's vmaped transition.obs.shape is of shape (episode_len, obs_dim)
     seq_len = transition.observation.shape[0]
@@ -97,6 +98,22 @@ def flatten_batch(buffer_config, transition, sample_key):
     state = transition.observation[:-1, :state_size]  # all states are considered
     new_obs = jnp.concatenate([state, goal], axis=1)
 
+    same_traj = jnp.equal(single_trajectories, single_trajectories.T)
+    big_neg = jnp.where(same_traj, arrangement[None, :], -1)
+    final_idx = jnp.max(big_neg, axis=1)
+    current_idx = arrangement[:-1]
+    short_goal_idx = jnp.minimum(current_idx + carl_subgoal_steps, final_idx[:-1])
+    carl_goal = transition.observation[short_goal_idx][:, goal_indices]
+
+    action_offsets = jnp.arange(carl_subgoal_steps)
+    action_idx = jnp.minimum(
+        current_idx[:, None] + action_offsets[None, :],
+        jnp.maximum(final_idx[:-1, None] - 1, current_idx[:, None]),
+    )
+    action_idx = jnp.minimum(action_idx, seq_len - 2)
+    action_sequence = jnp.take(transition.action, action_idx, axis=0)
+    action_sequence = jnp.reshape(action_sequence, (action_sequence.shape[0], -1))
+
     extras = {
         "policy_extras": {},
         "state_extras": {
@@ -106,6 +123,8 @@ def flatten_batch(buffer_config, transition, sample_key):
         "state": state,
         "future_state": future_state,
         "future_action": future_action,
+        "carl_goal": carl_goal,
+        "action_sequence": action_sequence,
     }
 
     return transition._replace(
@@ -130,12 +149,13 @@ def save_params(path: str, params: Any):
 
 
 @dataclass
-class CRL:
-    """Contrastive Reinforcement Learning (CRL) agent."""
+class CRLAuxCARL:
+    """CRL control with an auxiliary CARL representation loss."""
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
+    carl_lr: float = 3e-4
     batch_size: int = 256
 
     # gamma
@@ -158,6 +178,8 @@ class CRL:
 
     # phi(s,a) and psi(g) repr dimension
     repr_dim: int = 64
+    carl_repr_dim: int = 64
+    carl_subgoal_steps: int = 25
 
     # layer norm
     use_ln: bool = False
@@ -236,7 +258,9 @@ class CRL:
         random.seed(config.seed)
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
-        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key = jax.random.split(key, 7)
+        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key, sg_key, a_key = jax.random.split(
+            key, 9
+        )
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -318,6 +342,33 @@ class CRL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
+        # Auxiliary CARL encoders. These have an independent optimizer and never
+        # feed CRL actor/critic computations.
+        sg_encoder = Encoder(
+            repr_dim=self.carl_repr_dim,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            skip_connections=self.skip_connections,
+            use_relu=self.use_relu,
+            use_ln=self.use_ln,
+        )
+        a_encoder = Encoder(
+            repr_dim=self.carl_repr_dim,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            skip_connections=self.skip_connections,
+            use_relu=self.use_relu,
+            use_ln=self.use_ln,
+        )
+        carl_state = TrainState.create(
+            apply_fn=None,
+            params={
+                "sg_encoder": sg_encoder.init(sg_key, np.ones([1, state_size + goal_size])),
+                "a_encoder": a_encoder.init(a_key, np.ones([1, self.carl_subgoal_steps * action_size])),
+            },
+            tx=optax.adam(learning_rate=self.carl_lr),
+        )
+
         # Trainstate
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -325,6 +376,7 @@ class CRL:
             actor_state=actor_state,
             critic_state=critic_state,
             alpha_state=alpha_state,
+            carl_state=carl_state,
         )
 
         # Replay Buffer
@@ -455,6 +507,8 @@ class CRL:
                 actor=actor,
                 sa_encoder=sa_encoder,
                 g_encoder=g_encoder,
+                sg_encoder=sg_encoder,
+                a_encoder=a_encoder,
             )
 
             training_state, actor_metrics = update_actor_and_alpha(
@@ -463,11 +517,15 @@ class CRL:
             training_state, critic_metrics = update_critic(
                 context, networks, transitions, training_state, critic_key
             )
+            training_state, carl_metrics = update_carl_aux(
+                context, networks, transitions, training_state
+            )
             training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
             metrics = {}
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
+            metrics.update(carl_metrics)
 
             return (
                 training_state,
@@ -496,7 +554,12 @@ class CRL:
             # process transitions for training
             batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
-                (self.discounting, state_size, tuple(np.asarray(train_env.goal_indices))),
+                (
+                    self.discounting,
+                    state_size,
+                    tuple(np.asarray(train_env.goal_indices)),
+                    self.carl_subgoal_steps,
+                ),
                 transitions,
                 batch_keys,
             )
@@ -610,6 +673,12 @@ class CRL:
 
             do_render = ne % config.visualization_interval == 0
             make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
+            params = (
+                training_state.alpha_state.params,
+                training_state.actor_state.params,
+                training_state.critic_state.params,
+                training_state.carl_state.params,
+            )
 
             if _coverage_history:
                 all_pos = np.concatenate(_coverage_history, axis=0)
@@ -648,11 +717,6 @@ class CRL:
 
             if config.checkpoint_logdir:
                 # Save current policy and critic params.
-                params = (
-                    training_state.alpha_state.params,
-                    training_state.actor_state.params,
-                    training_state.critic_state.params,
-                )
                 path = f"{config.checkpoint_logdir}/step_{int(training_state.env_steps)}.pkl"
                 save_params(path, params)
 

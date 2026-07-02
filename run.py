@@ -108,6 +108,22 @@ def main(config: Config):
             "state_coverage_entropy",
             "state_coverage_cells",
         ],
+        "CRLAuxCARL": [
+            "training/actor_loss",
+            "training/log_alpha",
+            "training/alpha_loss",
+            "training/critic_loss",
+            "training/entropy",
+            "training/carl_loss",
+            "training/carl_infonce_loss",
+            "training/carl_logsumexp_penalty",
+            "training/carl_categorical_accuracy",
+            "training/carl_logits_pos",
+            "training/carl_logits_neg",
+            "training/carl_logit_gap",
+            "state_coverage_entropy",
+            "state_coverage_cells",
+        ],
         "HIQL": [
             "training/total_loss",
             "training/value/loss",
@@ -124,6 +140,9 @@ def main(config: Config):
             "training/high_actor/bc_log_prob",
             "training/high_actor/mse",
             "training/high_actor/std",
+            "training/planner/subgoal_dist",
+            "training/planner/final_goal_dist",
+            "training/planner/step_size",
             "state_coverage_entropy",
             "state_coverage_cells",
         ],
@@ -144,6 +163,9 @@ def main(config: Config):
             "training/high_actor/std",
             "training/alpha/low",
             "training/alpha/high",
+            "training/planner/subgoal_dist",
+            "training/planner/final_goal_dist",
+            "training/planner/step_size",
         ],
         "HCRL": [
             # Original CRL losses.
@@ -154,10 +176,19 @@ def main(config: Config):
             "training/entropy",
 
             # Critic diagnostics.
+            "training/carl_loss",
+            "training/carl_infonce_loss",
+            "training/carl_logsumexp_penalty",
+            "training/carl_categorical_accuracy",
+            "training/carl_logits_pos",
+            "training/carl_logits_neg",
+            "training/carl_logit_gap",
+            "training/carl_actor_encoder_grad_norm",
             "training/categorical_accuracy",
             "training/logits_pos",
             "training/logits_neg",
             "training/logsumexp",
+            "training/action_seq_norm",
 
             # High actor diagnostics.
             # These are zero/skipped when flat_policy=True.
@@ -169,6 +200,11 @@ def main(config: Config):
             # Replay/training diagnostics.
             "training/buffer_current_size",
             "training/gradient_steps",
+            "training/recent_replay_fraction",
+            "training/recent_replay_window",
+            "training/planner/subgoal_dist",
+            "training/planner/final_goal_dist",
+            "training/planner/step_size",
 
             # Optional state coverage.
             "state_coverage_entropy",
@@ -183,12 +219,19 @@ def main(config: Config):
             "training/entropy",
             "training/actor_sample_noise",
             "training/actor_action_abs_mean",
+            "training/low_actor_adv",
+            "training/value_low_loss",
+            "training/value_high_loss",
+            "training/value_low_mean",
+            "training/value_high_mean",
 
             # Critic diagnostics.
+            "training/carl_loss",
             "training/categorical_accuracy",
             "training/logits_pos",
             "training/logits_neg",
             "training/logsumexp",
+            "training/action_seq_norm",
 
             # High actor diagnostics.
             # These are zero/skipped when flat_policy=True.
@@ -198,10 +241,20 @@ def main(config: Config):
             "training/high_actor_std",
             "training/high_actor_log_std_mean",
             "training/high_actor_latent_noise_mean",
+            "training/high_actor_adv",
 
             # Replay/training diagnostics.
             "training/buffer_current_size",
             "training/gradient_steps",
+            "training/replay_loaded",
+            "training/offline_updates",
+            "training/planner/subgoal_dist",
+            "training/planner/final_goal_dist",
+            "training/planner/step_size",
+            "random_snapshot/action_abs_mean",
+            "random_snapshot/buffer_size",
+            "random_snapshot/env_steps",
+            "random_snapshot/snapshot_saved",
 
             # Optional state coverage.
             "state_coverage_entropy",

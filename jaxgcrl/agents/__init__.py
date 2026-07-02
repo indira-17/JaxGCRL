@@ -1,4 +1,5 @@
 from .crl import CRL
+from .crl_aux_carl import CRLAuxCARL
 from .hac import HAC
 from .hiql import HIQL
 from .hsac import HSAC

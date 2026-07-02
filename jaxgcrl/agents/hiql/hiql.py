@@ -23,6 +23,12 @@ from etils import epath
 from flax.struct import dataclass
 from flax.training.train_state import TrainState
 
+from jaxgcrl.agents.planner import (
+    PlannerMode,
+    oracle_subgoal,
+    planner_metrics,
+    validate_planner_config,
+)
 from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
@@ -92,6 +98,9 @@ class HIQL:
     low_actor_rep_grad: bool = False
     const_std: bool = True
     flat_policy: bool = False
+    planner_mode: PlannerMode = "none"
+    planner_step_size: float = 2.0
+    disable_high_actor_update_with_planner: bool = False
 
     value_p_curgoal: float = 0.2
     value_p_trajgoal: float = 0.5
@@ -131,8 +140,11 @@ class HIQL:
         env_steps_per_actor_step = config.num_envs * self.unroll_length
         num_prefill_env_steps = self.min_replay_size * config.num_envs
         num_prefill_actor_steps = np.ceil(self.min_replay_size / self.unroll_length)
-        num_training_steps_per_epoch = (config.total_env_steps - num_prefill_env_steps) // (
-            config.num_evals * env_steps_per_actor_step
+        num_training_steps_per_epoch = int(
+            np.ceil(
+                (config.total_env_steps - num_prefill_env_steps)
+                / (config.num_evals * env_steps_per_actor_step)
+            )
         )
 
         assert num_training_steps_per_epoch > 0
@@ -155,6 +167,11 @@ class HIQL:
         goal_size = len(train_env.goal_indices)
         obs_size = state_size + goal_size
         assert obs_size == train_env.observation_size
+        validate_planner_config(
+            self.planner_mode,
+            goal_indices=tuple(np.asarray(train_env.goal_indices)),
+            goal_size=goal_size,
+        )
 
         # ===== Network definitions =====
         goal_rep_module = GoalRep(
@@ -255,6 +272,9 @@ class HIQL:
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
         # ===== Config dict for losses =====
+        planner_disables_high_actor = (
+            self.planner_mode != "none" and self.disable_high_actor_update_with_planner
+        )
         hiql_config = dict(
             discount=self.discount,
             tau=self.tau,
@@ -263,7 +283,7 @@ class HIQL:
             high_alpha=self.high_alpha,
             low_actor_rep_grad=self.low_actor_rep_grad,
             goal_indices=tuple(train_env.goal_indices),
-            flat_policy=self.flat_policy,
+            flat_policy=self.flat_policy or planner_disables_high_actor,
         )
 
         # Closed-over constants for goal relabeling
@@ -275,6 +295,8 @@ class HIQL:
         _value_p_trajgoal = float(self.value_p_trajgoal)
         _value_geom_sample = bool(self.value_geom_sample)
         _flat_policy = bool(self.flat_policy)
+        _goal_indices_tuple = tuple(int(x) for x in np.asarray(train_env.goal_indices))
+        _use_planner = self.planner_mode != "none"
 
         def flatten_batch_hiql(transition, sample_key):
             """Relabel a trajectory segment into an HIQL training batch.
@@ -386,6 +408,15 @@ class HIQL:
             """Shared action selection for both stochastic and deterministic modes."""
             if _flat:
                 phi = goal_rep_module.apply(params["goal_rep"], state, goal)
+            elif _use_planner:
+                raw_subgoal = oracle_subgoal(
+                    state,
+                    goal,
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                phi = goal_rep_module.apply(params["goal_rep"], state, raw_subgoal)
             else:
                 high_key, key = jax.random.split(key)
                 high_dist = high_actor_module.apply(params["high_actor"], state, goal)
@@ -483,6 +514,23 @@ class HIQL:
             training_state, metrics = update_hiql(
                 hiql_config, networks, batch, training_state, update_key
             )
+            if _use_planner:
+                planner_subgoal = oracle_subgoal(
+                    batch["observations"],
+                    batch["high_actor_goals"],
+                    _goal_indices_tuple,
+                    self.planner_mode,
+                    self.planner_step_size,
+                )
+                metrics.update(
+                    planner_metrics(
+                        batch["observations"],
+                        batch["high_actor_goals"],
+                        planner_subgoal,
+                        _goal_indices_tuple,
+                        self.planner_step_size,
+                    )
+                )
             return (training_state, key), metrics
 
         @jax.jit
@@ -591,6 +639,15 @@ class HIQL:
                     g = obs[:, state_size:]
                     if _flat:
                         phi = goal_rep_module.apply(param["goal_rep"], s, g)
+                    elif _use_planner:
+                        raw_subgoal = oracle_subgoal(
+                            s,
+                            g,
+                            _goal_indices_tuple,
+                            self.planner_mode,
+                            self.planner_step_size,
+                        )
+                        phi = goal_rep_module.apply(param["goal_rep"], s, raw_subgoal)
                     else:
                         phi = high_actor_module.apply(param["high_actor"], s, g).mode()
                     action = low_actor_module.apply(param["low_actor"], s, phi).mode()
