@@ -1,6 +1,7 @@
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import optax
 
 
 def energy_fn(name, x, y):
@@ -33,12 +34,27 @@ def contrastive_loss_fn(name, logits):
 
 
 def update_actor_and_alpha(config, networks, transitions, training_state, key):
-    def actor_loss(actor_params, critic_params, log_alpha, transitions, key):
-        obs = transitions.observation  # expected_shape = self.batch_size, obs_size + goal_size
+    """SAC/CRL actor update conditioned on [state, CARL phi(state, goal)].
+
+    The CRL critic stays fixed during this actor update.  The CARL state-goal
+    encoder is differentiated jointly with the actor, so it receives the actor
+    gradient through the action sampled from pi(a | s, phi(s, g)).  The CARL
+    action-sequence encoder remains untouched by this update and is trained
+    only by update_carl_aux.
+    """
+
+    def actor_loss(actor_params, sg_encoder_params, critic_params, log_alpha, transitions, key):
+        obs = transitions.observation
         state = obs[:, : config["state_size"]]
         future_state = transitions.extras["future_state"]
         goal = future_state[:, config["goal_indices"]]
-        observation = jnp.concatenate([state, goal], axis=1)
+
+        # The actor's goal input is the CARL state-goal representation.
+        sg_repr = networks["sg_encoder"].apply(
+            sg_encoder_params,
+            jnp.concatenate([state, goal], axis=-1),
+        )
+        observation = jnp.concatenate([state, sg_repr], axis=-1)
 
         means, log_stds = networks["actor"].apply(actor_params, observation)
         stds = jnp.exp(log_stds)
@@ -46,19 +62,20 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
         action = nn.tanh(x_ts)
         log_prob = jax.scipy.stats.norm.logpdf(x_ts, loc=means, scale=stds)
         log_prob -= 2 * (jnp.log(2.0) - x_ts - nn.softplus(-2.0 * x_ts))
-        log_prob = log_prob.sum(-1)  # dimension = B
+        log_prob = log_prob.sum(-1)
 
         sa_encoder_params, g_encoder_params = (
             critic_params["sa_encoder"],
             critic_params["g_encoder"],
         )
-        sa_repr = networks["sa_encoder"].apply(sa_encoder_params, jnp.concatenate([state, action], axis=-1))
+        sa_repr = networks["sa_encoder"].apply(
+            sa_encoder_params,
+            jnp.concatenate([state, action], axis=-1),
+        )
         g_repr = networks["g_encoder"].apply(g_encoder_params, goal)
-
         qf_pi = energy_fn(config["energy_fn"], sa_repr, g_repr)
 
         actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
-
         return actor_loss, log_prob
 
     def alpha_loss(alpha_params, log_prob):
@@ -66,8 +83,13 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
         alpha_loss = alpha * jnp.mean(jax.lax.stop_gradient(-log_prob - config["target_entropy"]))
         return jnp.mean(alpha_loss)
 
-    (actor_loss, log_prob), actor_grad = jax.value_and_grad(actor_loss, has_aux=True)(
+    (actor_loss, log_prob), (actor_grad, sg_grad) = jax.value_and_grad(
+        actor_loss,
+        argnums=(0, 1),
+        has_aux=True,
+    )(
         training_state.actor_state.params,
+        training_state.carl_state.params["sg_encoder"],
         training_state.critic_state.params,
         training_state.alpha_state.params["log_alpha"],
         transitions,
@@ -75,16 +97,31 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
     )
     new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
 
+    # Keep the existing independent CARL optimizer.
+    actor_carl_grads = {
+        "sg_encoder": sg_grad,
+        "a_encoder": jax.tree_util.tree_map(
+            jnp.zeros_like,
+            training_state.carl_state.params["a_encoder"],
+        ),
+    }
+    new_carl_state = training_state.carl_state.apply_gradients(grads=actor_carl_grads)
+
     alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
     new_alpha_state = training_state.alpha_state.apply_gradients(grads=alpha_grad)
 
-    training_state = training_state.replace(actor_state=new_actor_state, alpha_state=new_alpha_state)
+    training_state = training_state.replace(
+        actor_state=new_actor_state,
+        alpha_state=new_alpha_state,
+        carl_state=new_carl_state,
+    )
 
     metrics = {
         "entropy": -log_prob,
         "actor_loss": actor_loss,
         "alpha_loss": alpha_loss,
         "log_alpha": training_state.alpha_state.params["log_alpha"],
+        "actor_carl_sg_grad_norm": optax.global_norm(sg_grad),
     }
 
     return training_state, metrics

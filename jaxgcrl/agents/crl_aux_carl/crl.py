@@ -54,6 +54,196 @@ class Transition(NamedTuple):
     extras: jnp.ndarray = ()
 
 
+# The planner is kept in this file so this CRL + auxiliary-CARL agent can run
+# without requiring the hierarchical HCARL module.  It is an oracle local-goal
+# controller for Ant-style two-dimensional goals, not a learned high actor.
+PlannerMode = Literal["none", "ant_xy_oracle"]
+
+
+def validate_planner_config(
+    planner_mode: PlannerMode,
+    *,
+    goal_indices: Tuple[int, ...],
+    goal_size: int,
+) -> None:
+    if planner_mode not in ("none", "ant_xy_oracle"):
+        raise ValueError(
+            f"Unknown planner_mode={planner_mode!r}. "
+            "Expected 'none' or 'ant_xy_oracle'."
+        )
+    if planner_mode == "ant_xy_oracle":
+        if goal_size != 2 or len(goal_indices) != 2:
+            raise ValueError(
+                "planner_mode='ant_xy_oracle' requires exactly two goal "
+                f"coordinates, got goal_size={goal_size}, goal_indices={goal_indices}."
+            )
+
+
+def oracle_subgoal(
+    state: jnp.ndarray,
+    final_goal: jnp.ndarray,
+    goal_indices: Tuple[int, ...],
+    planner_mode: PlannerMode,
+    planner_step_size: float,
+) -> jnp.ndarray:
+    """Returns a straight-line, bounded-distance XY waypoint.
+
+    The function is JAX-compatible and therefore can be called inside rollout
+    and evaluation JITs.  For ``planner_mode='none'`` it simply returns the
+    original final goal.
+    """
+    if planner_mode == "none":
+        return final_goal
+
+    state_xy = jnp.take(
+        state,
+        jnp.asarray(goal_indices, dtype=jnp.int32),
+        axis=-1,
+    )
+    direction = final_goal - state_xy
+    distance = jnp.linalg.norm(direction, axis=-1, keepdims=True)
+    step_fraction = jnp.minimum(
+        1.0,
+        float(planner_step_size) / jnp.maximum(distance, 1e-6),
+    )
+    return state_xy + step_fraction * direction
+
+
+def planner_metrics(
+    state: jnp.ndarray,
+    final_goal: jnp.ndarray,
+    subgoal: jnp.ndarray,
+    goal_indices: Tuple[int, ...],
+) -> dict[str, jnp.ndarray]:
+    """Summarizes the oracle planner's current waypoint geometry."""
+    state_xy = jnp.take(
+        state,
+        jnp.asarray(goal_indices, dtype=jnp.int32),
+        axis=-1,
+    )
+    final_distance = jnp.linalg.norm(final_goal - state_xy, axis=-1)
+    subgoal_distance = jnp.linalg.norm(subgoal - state_xy, axis=-1)
+    return {
+        "planner/final_goal_distance": jnp.mean(final_distance),
+        "planner/subgoal_distance": jnp.mean(subgoal_distance),
+        "planner/subgoal_fraction": jnp.mean(
+            subgoal_distance / jnp.maximum(final_distance, 1e-6)
+        ),
+    }
+
+
+def _joint_pca_2d(vectors: np.ndarray) -> np.ndarray:
+    """Projects vectors to a common two-dimensional PCA coordinate system."""
+    vectors = np.asarray(vectors, dtype=np.float64)
+    if vectors.ndim != 2 or vectors.shape[0] == 0:
+        raise ValueError("Expected a non-empty [num_vectors, latent_dim] array.")
+
+    centered = vectors - vectors.mean(axis=0, keepdims=True)
+    num_components = min(2, centered.shape[0], centered.shape[1])
+    if num_components == 0:
+        return np.zeros((centered.shape[0], 2), dtype=np.float64)
+
+    _, _, right_singular_vectors = np.linalg.svd(centered, full_matrices=False)
+    projection = centered @ right_singular_vectors[:num_components].T
+    if num_components == 1:
+        projection = np.pad(projection, ((0, 0), (0, 1)))
+    return projection
+
+
+def make_alignment_figure(
+    left_repr: np.ndarray,
+    right_repr: np.ndarray,
+    goal_delta: np.ndarray,
+    *,
+    title: str,
+    left_label: str,
+    right_label: str,
+    num_links: int,
+):
+    """Plots two matched embedding sets in one PCA space.
+
+    Each circle and cross with the same color is a positive contrastive pair.
+    The faint connecting segments make pair alignment visible without changing
+    training or replay sampling.
+    """
+    left_repr = np.asarray(left_repr)
+    right_repr = np.asarray(right_repr)
+    goal_delta = np.asarray(goal_delta)
+
+    joint_projection = _joint_pca_2d(np.concatenate([left_repr, right_repr], axis=0))
+    num_pairs = left_repr.shape[0]
+    left_2d = joint_projection[:num_pairs]
+    right_2d = joint_projection[num_pairs:]
+
+    if goal_delta.shape[-1] >= 2:
+        color_values = np.arctan2(goal_delta[:, 1], goal_delta[:, 0])
+        color_label = "goal direction (radians)"
+        cmap = "twilight"
+    else:
+        color_values = np.linalg.norm(goal_delta, axis=-1)
+        color_label = "goal displacement"
+        cmap = "viridis"
+
+    color_min = float(np.nanmin(color_values))
+    color_max = float(np.nanmax(color_values))
+    if np.isclose(color_min, color_max):
+        color_max = color_min + 1.0
+
+    positive_l2 = float(np.linalg.norm(left_repr - right_repr, axis=-1).mean())
+    shuffled_l2 = float(
+        np.linalg.norm(left_repr - np.roll(right_repr, shift=1, axis=0), axis=-1).mean()
+    )
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    left_scatter = ax.scatter(
+        left_2d[:, 0],
+        left_2d[:, 1],
+        c=color_values,
+        cmap=cmap,
+        vmin=color_min,
+        vmax=color_max,
+        marker="o",
+        s=18,
+        alpha=0.65,
+        label=left_label,
+    )
+    ax.scatter(
+        right_2d[:, 0],
+        right_2d[:, 1],
+        c=color_values,
+        cmap=cmap,
+        vmin=color_min,
+        vmax=color_max,
+        marker="x",
+        s=24,
+        alpha=0.65,
+        label=right_label,
+    )
+
+    link_count = min(max(int(num_links), 0), num_pairs)
+    if link_count > 0:
+        link_indices = np.linspace(0, num_pairs - 1, link_count, dtype=np.int32)
+        for index in link_indices:
+            ax.plot(
+                [left_2d[index, 0], right_2d[index, 0]],
+                [left_2d[index, 1], right_2d[index, 1]],
+                linewidth=0.5,
+                alpha=0.18,
+            )
+
+    colorbar = fig.colorbar(left_scatter, ax=ax, pad=0.02)
+    colorbar.set_label(color_label)
+    ax.set_title(
+        f"{title} (joint PCA)\n"
+        f"positive L2 = {positive_l2:.3f}, shuffled L2 = {shuffled_l2:.3f}"
+    )
+    ax.set_xlabel("PCA component 1")
+    ax.set_ylabel("PCA component 2")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+
 @functools.partial(jax.jit, static_argnames=("buffer_config"))
 def flatten_batch(buffer_config, transition, sample_key):
     gamma, state_size, goal_indices, carl_subgoal_steps = buffer_config
@@ -187,6 +377,15 @@ class CRLAuxCARL:
     contrastive_loss_fn: Literal["fwd_infonce", "sym_infonce", "bwd_infonce", "binary_nce"] = "fwd_infonce"
     energy_fn: Literal["norm", "l2", "dot", "cosine"] = "norm"
 
+    # Optional oracle planner.  It replaces the final environment goal only when feeding the CRL actor during collection/evaluation.
+    planner_mode: PlannerMode = "none"
+    planner_step_size: float = 2.0
+
+    # Replay-based CRL/CARL representation diagnostics.  They run only at rendering intervals and never update the replay sampler state.
+    log_representation_space: bool = False
+    representation_viz_max_points: int = 2048
+    representation_viz_num_links: int = 100
+
     # State coverage visualization
     log_state_coverage: bool = False
     state_coverage_xy_dims: Tuple[int, int] = (0, 1)
@@ -212,6 +411,13 @@ class CRLAuxCARL:
         progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     ):
         self.check_config(config)
+        logging.info("CRL auxiliary CARL planner_mode: %s", self.planner_mode)
+        logging.info("CRL low actor input: [state, CARL phi(state, goal)]")
+        logging.info("CRL auxiliary CARL state coverage: %s", self.log_state_coverage)
+        logging.info(
+            "CRL auxiliary CARL representation diagnostics: %s",
+            self.log_representation_space,
+        )
 
         unwrapped_env = train_env
         train_env = TrajectoryIdWrapper(train_env)
@@ -275,6 +481,15 @@ class CRLAuxCARL:
             f"obs_size: {obs_size}, observation_size: {train_env.observation_size}"
         )
 
+        _goal_indices_tuple = tuple(int(x) for x in np.asarray(train_env.goal_indices))
+        _goal_indices_arr = jnp.asarray(_goal_indices_tuple, dtype=jnp.int32)
+        _use_planner = self.planner_mode != "none"
+        validate_planner_config(
+            self.planner_mode,
+            goal_indices=_goal_indices_tuple,
+            goal_size=goal_size,
+        )
+
         # State coverage tracking
         # If the env exposes goal_indices we use its first two entries (the agent's x,y in obs)
         _raw_goal_indices = getattr(unwrapped_env, "goal_indices", None)
@@ -302,9 +517,14 @@ class CRLAuxCARL:
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
+        # The flat SAC/CRL actor is conditioned on raw state plus the CARL
+        # state-goal representation, not on raw goal coordinates.
         actor_state = TrainState.create(
             apply_fn=actor.apply,
-            params=actor.init(actor_key, np.ones([1, obs_size])),
+            params=actor.init(
+                actor_key,
+                np.ones([1, state_size + self.carl_repr_dim]),
+            ),
             tx=optax.adam(learning_rate=self.policy_lr),
         )
 
@@ -342,8 +562,10 @@ class CRLAuxCARL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
-        # Auxiliary CARL encoders. These have an independent optimizer and never
-        # feed CRL actor/critic computations.
+        # CARL encoders.  phi(s, goal) conditions the CRL/SAC actor and is
+        # updated by both the actor objective and the CARL InfoNCE objective.
+        # The action-sequence encoder remains auxiliary and is updated only by
+        # CARL InfoNCE.
         sg_encoder = Encoder(
             repr_dim=self.carl_repr_dim,
             network_width=self.h_dim,
@@ -412,8 +634,28 @@ class CRLAuxCARL:
         )
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
+        def _planned_actor_observation(raw_obs, sg_encoder_params):
+            """Builds [state, phi_CARL(state, local goal)] for the flat actor.
+
+            With ``planner_mode='ant_xy_oracle'`` the local goal is the oracle
+            XY waypoint.  There is no high actor in this CRL + CARL-aux agent,
+            so no high-level parameters are used or updated.
+            """
+            state = raw_obs[:, :state_size]
+            final_goal = raw_obs[:, state_size:]
+            actor_goal = oracle_subgoal(state, final_goal, _goal_indices_tuple, self.planner_mode, self.planner_step_size)
+            sg_repr = sg_encoder.apply(
+                sg_encoder_params,
+                jnp.concatenate([state, actor_goal], axis=-1),
+            )
+            return jnp.concatenate([state, sg_repr], axis=-1)
+
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
-            means, _ = actor.apply(training_state.actor_state.params, env_state.obs)
+            actor_obs = _planned_actor_observation(
+                env_state.obs,
+                training_state.carl_state.params["sg_encoder"],
+            )
+            means, _ = actor.apply(training_state.actor_state.params, actor_obs)
             actions = nn.tanh(means)
 
             nstate = env.step(env_state, actions)
@@ -427,10 +669,16 @@ class CRLAuxCARL:
                 extras={"state_extras": state_extras},
             )
 
-        def actor_step(actor_state, env, env_state, key, extra_fields):
-            means, log_stds = actor.apply(actor_state.params, env_state.obs)
+        def actor_step(actor_state, carl_state, env, env_state, key, extra_fields):
+            actor_obs = _planned_actor_observation(
+                env_state.obs,
+                carl_state.params["sg_encoder"],
+            )
+            means, log_stds = actor.apply(actor_state.params, actor_obs)
             stds = jnp.exp(log_stds)
-            actions = nn.tanh(means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype))
+            actions = nn.tanh(
+                means + stds * jax.random.normal(key, shape=means.shape, dtype=means.dtype)
+            )
 
             nstate = env.step(env_state, actions)
             state_extras = {x: nstate.info[x] for x in extra_fields}
@@ -444,13 +692,14 @@ class CRLAuxCARL:
             )
 
         @jax.jit
-        def get_experience(actor_state, env_state, buffer_state, key):
+        def get_experience(actor_state, carl_state, env_state, buffer_state, key):
             @jax.jit
             def f(carry, unused_t):
                 env_state, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
                 env_state, transition = actor_step(
                     actor_state,
+                    carl_state,
                     train_env,
                     env_state,
                     current_key,
@@ -458,7 +707,12 @@ class CRLAuxCARL:
                 )
                 return (env_state, next_key), transition
 
-            (env_state, _), data = jax.lax.scan(f, (env_state, key), (), length=self.unroll_length)
+            (env_state, _), data = jax.lax.scan(
+                f,
+                (env_state, key),
+                (),
+                length=self.unroll_length,
+            )
 
             buffer_state = replay_buffer.insert(buffer_state, data)
             return env_state, buffer_state
@@ -471,6 +725,7 @@ class CRLAuxCARL:
                 key, new_key = jax.random.split(key)
                 env_state, buffer_state = get_experience(
                     training_state.actor_state,
+                    training_state.carl_state,
                     env_state,
                     buffer_state,
                     key,
@@ -526,11 +781,99 @@ class CRLAuxCARL:
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
             metrics.update(carl_metrics)
+            if _use_planner:
+                state = transitions.extras["state"]
+                final_goal = transitions.observation[:, state_size:]
+                subgoal = oracle_subgoal(state, final_goal, _goal_indices_tuple, self.planner_mode, self.planner_step_size)
+                metrics.update(planner_metrics(state, final_goal, subgoal, _goal_indices_tuple))
 
-            return (
-                training_state,
-                key,
-            ), metrics
+            return (training_state, key), metrics
+
+        @jax.jit
+        def sample_representation_pairs(
+            critic_params,
+            carl_params,
+            buffer_state,
+            sample_key,
+        ):
+            """Reads matched CRL and CARL positives without changing replay state."""
+            _, raw_transitions = replay_buffer.sample(buffer_state)
+            relabel_key, select_key = jax.random.split(sample_key)
+            batch_keys = jax.random.split(
+                relabel_key,
+                raw_transitions.observation.shape[0],
+            )
+            batches = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
+                (
+                    self.discounting,
+                    state_size,
+                    _goal_indices_tuple,
+                    self.carl_subgoal_steps,
+                ),
+                raw_transitions,
+                batch_keys,
+            )
+            batches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"),
+                batches,
+            )
+
+            total_pairs = batches.observation.shape[0]
+            num_pairs = min(int(self.representation_viz_max_points), total_pairs)
+            selected = jax.random.permutation(select_key, total_pairs)[:num_pairs]
+
+            state = batches.extras["state"][selected]
+            crl_goal = batches.observation[selected, state_size:]
+            action = batches.action[selected]
+            carl_goal = batches.extras["carl_goal"][selected]
+            action_sequence = batches.extras["action_sequence"][selected]
+
+            crl_sa_repr = sa_encoder.apply(
+                critic_params["sa_encoder"],
+                jnp.concatenate([state, action], axis=-1),
+            )
+            crl_goal_repr = g_encoder.apply(
+                critic_params["g_encoder"],
+                crl_goal,
+            )
+            carl_sg_repr = sg_encoder.apply(
+                carl_params["sg_encoder"],
+                jnp.concatenate([state, carl_goal], axis=-1),
+            )
+            carl_action_repr = a_encoder.apply(
+                carl_params["a_encoder"],
+                action_sequence,
+            )
+
+            crl_goal_delta = crl_goal - state[:, _goal_indices_arr]
+            carl_goal_delta = carl_goal - state[:, _goal_indices_arr]
+
+            def alignment_metrics(left, right, prefix):
+                shuffled_right = jnp.roll(right, shift=1, axis=0)
+                positive_l2 = jnp.linalg.norm(left - right, axis=-1)
+                shuffled_l2 = jnp.linalg.norm(left - shuffled_right, axis=-1)
+                cosine = jnp.sum(left * right, axis=-1) / (
+                    jnp.linalg.norm(left, axis=-1)
+                    * jnp.linalg.norm(right, axis=-1)
+                    + 1e-8
+                )
+                return {
+                    f"{prefix}/positive_l2": jnp.mean(positive_l2),
+                    f"{prefix}/shuffled_l2": jnp.mean(shuffled_l2),
+                    f"{prefix}/l2_margin": jnp.mean(shuffled_l2 - positive_l2),
+                    f"{prefix}/positive_cosine": jnp.mean(cosine),
+                    f"{prefix}/left_norm": jnp.mean(jnp.linalg.norm(left, axis=-1)),
+                    f"{prefix}/right_norm": jnp.mean(jnp.linalg.norm(right, axis=-1)),
+                }
+
+            representation_metrics = {}
+            representation_metrics.update(
+                alignment_metrics(crl_sa_repr, crl_goal_repr, "crl_repr")
+            )
+            representation_metrics.update(
+                alignment_metrics(carl_sg_repr, carl_action_repr, "carl_repr")
+            )
+            return crl_sa_repr, crl_goal_repr, crl_goal_delta, carl_sg_repr, carl_action_repr, carl_goal_delta, representation_metrics
 
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key):
@@ -539,6 +882,7 @@ class CRLAuxCARL:
             # update buffer
             env_state, buffer_state = get_experience(
                 training_state.actor_state,
+                training_state.carl_state,
                 env_state,
                 buffer_state,
                 experience_key1,
@@ -672,13 +1016,74 @@ class CRLAuxCARL:
             logging.info("step: %d", current_step)
 
             do_render = ne % config.visualization_interval == 0
-            make_policy = lambda param: lambda obs, rng: actor.apply(param, obs)
+
+            def make_policy(policy_params):
+                def policy(obs, rng):
+                    del rng
+                    actor_obs = _planned_actor_observation(
+                        obs,
+                        policy_params["sg_encoder"],
+                    )
+                    return actor.apply(policy_params["actor"], actor_obs)
+                return policy
+
+            policy_params = {
+                "actor": training_state.actor_state.params,
+                "sg_encoder": training_state.carl_state.params["sg_encoder"],
+            }
             params = (
                 training_state.alpha_state.params,
                 training_state.actor_state.params,
                 training_state.critic_state.params,
                 training_state.carl_state.params,
             )
+
+            if self.log_representation_space and do_render:
+                # A folded-in key and the discarded replay sampler state ensure
+                # diagnostics cannot alter future training batches or RNG use.
+                representation_key = jax.random.fold_in(
+                    jax.random.PRNGKey(config.seed),
+                    current_step,
+                )
+                crl_sa_repr, crl_goal_repr, crl_goal_delta, carl_sg_repr, carl_action_repr, carl_goal_delta, representation_metrics = sample_representation_pairs(
+                    training_state.critic_state.params,
+                    training_state.carl_state.params,
+                    buffer_state,
+                    representation_key,
+                )
+                representation_metrics = jax.tree_util.tree_map(
+                    lambda x: float(jnp.asarray(x).block_until_ready()),
+                    representation_metrics,
+                )
+                metrics.update(representation_metrics)
+
+                crl_figure = make_alignment_figure(
+                    np.asarray(jax.device_get(crl_sa_repr)),
+                    np.asarray(jax.device_get(crl_goal_repr)),
+                    np.asarray(jax.device_get(crl_goal_delta)),
+                    title="CRL state-action / goal representation space",
+                    left_label=r"$f(s_t, a_t)$",
+                    right_label=r"$g(g_t)$",
+                    num_links=self.representation_viz_num_links,
+                )
+                carl_figure = make_alignment_figure(
+                    np.asarray(jax.device_get(carl_sg_repr)),
+                    np.asarray(jax.device_get(carl_action_repr)),
+                    np.asarray(jax.device_get(carl_goal_delta)),
+                    title="Auxiliary CARL state-goal / action-sequence space",
+                    left_label=r"$\phi(s_t, s_{t+K})$",
+                    right_label=r"$e(a_{t:t+K-1})$",
+                    num_links=self.representation_viz_num_links,
+                )
+                wandb.log(
+                    {
+                        "crl_representation_space": wandb.Image(crl_figure),
+                        "carl_representation_space": wandb.Image(carl_figure),
+                    },
+                    step=current_step,
+                )
+                plt.close(crl_figure)
+                plt.close(carl_figure)
 
             if _coverage_history:
                 all_pos = np.concatenate(_coverage_history, axis=0)
@@ -687,11 +1092,13 @@ class CRLAuxCARL:
                     all_pos[:, 0], all_pos[:, 1], bins=bins
                 )
                 
-                # Coverage entropy: higher = more uniform exploration
-                p = h / h.sum()
+                # Coverage entropy: higher = more uniform exploration.
+                p = h / max(float(h.sum()), 1.0)
                 p_nz = p[p > 0]
                 coverage_entropy = float(-np.sum(p_nz * np.log(p_nz)))
                 occupied_cells = int(np.sum(h > 0))
+                metrics["state_coverage_entropy"] = coverage_entropy
+                metrics["state_coverage_cells"] = occupied_cells
 
                 if do_render:
                     fig, ax = plt.subplots(figsize=(6, 6))
@@ -710,7 +1117,7 @@ class CRLAuxCARL:
                 current_step,
                 metrics,
                 make_policy,
-                training_state.actor_state.params,
+                policy_params,
                 unwrapped_env,
                 do_render=do_render,
             )

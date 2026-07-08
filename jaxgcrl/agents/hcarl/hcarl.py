@@ -2,7 +2,7 @@
 
 Design goal:
   - CARL learns phi(s, g) using state-goal/action-sequence contrastive loss.
-  - Value learns V(s, phi(s, g)) with an HIQL-style expectile TD loss.
+  - Low value learns V(s, g_raw) with an HIQL-style expectile TD loss.
   - Low actor is AWR/NLL on dataset actions conditioned on phi(s, local_goal).
   - High actor is AWR/NLL on latent subgoals phi(s, k-step_subgoal).
 """
@@ -58,6 +58,7 @@ class TrainingState:
     target_critic_params: Any
     alpha_state: TrainState
     high_actor_state: TrainState
+    sg_actor_opt_state: Any
 
 
 class Transition(NamedTuple):
@@ -175,6 +176,108 @@ def _pack_params(training_state: TrainingState):
     }
 
 
+def _joint_pca_2d(vectors: np.ndarray) -> np.ndarray:
+    """Projects a set of vectors to two dimensions using a shared PCA basis."""
+    vectors = np.asarray(vectors, dtype=np.float64)
+    if vectors.ndim != 2 or vectors.shape[0] == 0:
+        raise ValueError("Expected a non-empty [num_vectors, latent_dim] array.")
+
+    centered = vectors - vectors.mean(axis=0, keepdims=True)
+    num_components = min(2, centered.shape[0], centered.shape[1])
+    if num_components == 0:
+        return np.zeros((centered.shape[0], 2), dtype=np.float64)
+
+    _, _, right_singular_vectors = np.linalg.svd(centered, full_matrices=False)
+    projection = centered @ right_singular_vectors[:num_components].T
+    if num_components == 1:
+        projection = np.pad(projection, ((0, 0), (0, 1)))
+    return projection
+
+
+def make_carl_representation_figure(
+    state_goal_repr: np.ndarray,
+    action_repr: np.ndarray,
+    goal_delta: np.ndarray,
+    num_links: int,
+):
+    """Plots matched CARL state-goal and action-sequence embeddings in one PCA space."""
+    state_goal_repr = np.asarray(state_goal_repr)
+    action_repr = np.asarray(action_repr)
+    goal_delta = np.asarray(goal_delta)
+
+    joint_projection = _joint_pca_2d(np.concatenate([state_goal_repr, action_repr], axis=0))
+    num_pairs = state_goal_repr.shape[0]
+    state_goal_2d = joint_projection[:num_pairs]
+    action_2d = joint_projection[num_pairs:]
+
+    if goal_delta.shape[-1] >= 2:
+        color_values = np.arctan2(goal_delta[:, 1], goal_delta[:, 0])
+        color_label = "local-goal direction (radians)"
+        cmap = "twilight"
+    else:
+        color_values = np.linalg.norm(goal_delta, axis=-1)
+        color_label = "local-goal displacement"
+        cmap = "viridis"
+
+    color_min = float(np.nanmin(color_values))
+    color_max = float(np.nanmax(color_values))
+    if np.isclose(color_min, color_max):
+        color_max = color_min + 1.0
+
+    positive_distance = np.linalg.norm(state_goal_repr - action_repr, axis=-1).mean()
+    shuffled_distance = np.linalg.norm(state_goal_repr - np.roll(action_repr, shift=1, axis=0), axis=-1).mean()
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    state_scatter = ax.scatter(
+        state_goal_2d[:, 0],
+        state_goal_2d[:, 1],
+        c=color_values,
+        cmap=cmap,
+        vmin=color_min,
+        vmax=color_max,
+        marker="o",
+        s=18,
+        alpha=0.65,
+        label=r"$\phi(s_t, s_{t+K})$",
+    )
+    ax.scatter(
+        action_2d[:, 0],
+        action_2d[:, 1],
+        c=color_values,
+        cmap=cmap,
+        vmin=color_min,
+        vmax=color_max,
+        marker="x",
+        s=24,
+        alpha=0.65,
+        label=r"$e(a_{t:t+K-1})$",
+    )
+
+    link_count = min(max(int(num_links), 0), num_pairs)
+    if link_count > 0:
+        link_indices = np.linspace(0, num_pairs - 1, link_count, dtype=np.int32)
+        for index in link_indices:
+            ax.plot(
+                [state_goal_2d[index, 0], action_2d[index, 0]],
+                [state_goal_2d[index, 1], action_2d[index, 1]],
+                linewidth=0.5,
+                alpha=0.18,
+            )
+
+    colorbar = fig.colorbar(state_scatter, ax=ax, pad=0.02)
+    colorbar.set_label(color_label)
+    ax.set_title(
+        "CARL representation space (joint PCA)\n"
+        f"positive L2 = {positive_distance:.3f}, "
+        f"shuffled L2 = {shuffled_distance:.3f}"
+    )
+    ax.set_xlabel("PCA component 1")
+    ax.set_ylabel("PCA component 2")
+    ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+
 @dataclass
 class HCARL:
     subgoal_steps: int = 25
@@ -240,6 +343,12 @@ class HCARL:
     log_state_coverage: bool = False
     state_coverage_xy_dims: Tuple[int, int] = (0, 1)
 
+    # Replay-based CARL representation diagnostic. It is evaluated only at
+    # visualization intervals and does not affect the replay sampler state.
+    log_representation_space: bool = False
+    representation_viz_max_points: int = 2048
+    representation_viz_num_links: int = 100
+
     def check_config(self, config):
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
@@ -260,6 +369,7 @@ class HCARL:
 
         logging.info("HCARL flat_policy: %s", self.flat_policy)
         logging.info("HCARL log_state_coverage: %s", self.log_state_coverage)
+        logging.info("HCARL log_representation_space: %s", self.log_representation_space)
         logging.info("HCARL use_split_values: %s", self.use_split_values)
         logging.info("HCARL planner_mode: %s", self.planner_mode)
 
@@ -409,7 +519,8 @@ class HCARL:
         dummy_actor_obs = jnp.ones((1, state_size + self.repr_dim))
         actor_params = actor_module.init(actor_key, dummy_actor_obs)
         high_params = high_actor_module.init(high_key, dummy_obs)
-        value_low_params = value_low_module.init(value_low_key, dummy_state, dummy_rep)
+        # Low value is conditioned on raw local/planner subgoal coordinates, not phi(s, g).
+        value_low_params = value_low_module.init(value_low_key, dummy_state, dummy_goal)
         value_high_params = value_high_module.init(value_high_key, dummy_state, dummy_goal)
 
         critic_state = TrainState.create(
@@ -437,6 +548,11 @@ class HCARL:
             params={"log_alpha": jnp.array(0.0)},
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
+        # CARL's state-goal encoder receives a second, dedicated optimizer
+        # stream from the low/high AWR actor losses.  This avoids applying
+        # zero actor gradients through the full critic Adam state.
+        sg_actor_tx = optax.adam(learning_rate=self.critic_lr)
+        sg_actor_opt_state = sg_actor_tx.init(critic_state.params["sg_encoder"])
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
@@ -445,6 +561,7 @@ class HCARL:
             target_critic_params=critic_state.params,
             alpha_state=alpha_state,
             high_actor_state=high_actor_state,
+            sg_actor_opt_state=sg_actor_opt_state,
         )
 
         dummy_transition = Transition(
@@ -508,6 +625,9 @@ class HCARL:
         _subgoal_steps = int(self.subgoal_steps)
         _flat_policy = bool(self.flat_policy)
         _use_planner = self.planner_mode != "none"
+        # In flat or planner mode there is no learned high policy, so the
+        # high value branch has no downstream use and is disabled as well.
+        crl_config["train_high_value"] = not (_flat_policy or _use_planner)
         _env_name = str(getattr(config, "env", "unknown"))
 
         def flatten_batch_hcrl(transition, sample_key):
@@ -851,26 +971,50 @@ class HCARL:
             training_state, critic_metrics = update_critic(
                 crl_config, networks, batch, training_state, critic_key
             )
-            training_state, actor_metrics = update_actor_and_alpha(
+            training_state, actor_metrics, low_actor_sg_grad = update_actor_and_alpha(
                 crl_config, networks, batch, training_state, actor_key
             )
 
-            if _flat_policy or (_use_planner and self.disable_high_actor_update_with_planner):
-                high_actor_metrics = {
-                    "high_actor_loss": jnp.array(0.0),
-                    "high_actor_log_prob": jnp.array(0.0),
-                    "high_actor_mse": jnp.array(0.0),
-                    "high_actor_std": jnp.array(0.0),
-                    "high_actor_weight": jnp.array(0.0),
-                    "high_actor_adv": jnp.array(0.0),
-                    "high_actor_v_curr": jnp.array(0.0),
-                    "high_actor_v_next": jnp.array(0.0),
-                    "high_actor_log_std_mean": jnp.array(0.0),
-                    "high_actor_latent_noise_mean": jnp.array(0.0),
-                }
-            else:
-                training_state, high_actor_metrics = update_high_actor(
+            # A planner supplies the subgoal directly, so the learned high actor
+            # is not part of behavior and must not be updated in planner mode.
+            high_actor_is_active = not (_flat_policy or _use_planner)
+            if high_actor_is_active:
+                training_state, high_actor_metrics, high_actor_sg_grad = update_high_actor(
                     crl_config, networks, batch, training_state, high_actor_key
+                )
+            else:
+                # Do not emit placeholder high-actor losses: their presence in
+                # W&B is misleading because the learned high actor is not used
+                # or updated in flat/planner mode.
+                high_actor_metrics = {}
+                high_actor_sg_grad = jax.tree_util.tree_map(
+                    jnp.zeros_like, training_state.critic_state.params["sg_encoder"]
+                )
+
+            # Apply the summed low/high actor gradient to phi(s, g) only.
+            # The action-sequence encoder and both values stay on their critic
+            # update path; they do not receive actor-loss gradients.
+            sg_actor_grad = jax.tree_util.tree_map(
+                lambda low_grad, high_grad: low_grad + high_grad,
+                low_actor_sg_grad,
+                high_actor_sg_grad,
+            )
+            sg_params = training_state.critic_state.params["sg_encoder"]
+            sg_updates, sg_actor_opt_state = sg_actor_tx.update(
+                sg_actor_grad, training_state.sg_actor_opt_state, sg_params
+            )
+            updated_sg_params = optax.apply_updates(sg_params, sg_updates)
+            updated_critic_params = dict(training_state.critic_state.params)
+            updated_critic_params["sg_encoder"] = updated_sg_params
+            training_state = training_state.replace(
+                critic_state=training_state.critic_state.replace(params=updated_critic_params),
+                sg_actor_opt_state=sg_actor_opt_state,
+            )
+            actor_metrics["sg_encoder_actor_grad_norm"] = optax.global_norm(sg_actor_grad)
+            actor_metrics["sg_encoder_low_actor_grad_norm"] = optax.global_norm(low_actor_sg_grad)
+            if high_actor_is_active:
+                high_actor_metrics["sg_encoder_high_actor_grad_norm"] = optax.global_norm(
+                    high_actor_sg_grad
                 )
             if _use_planner:
                 state = batch.extras["state"]
@@ -899,6 +1043,9 @@ class HCARL:
             metrics.update(critic_metrics)
             metrics.update(actor_metrics)
             metrics.update(high_actor_metrics)
+            metrics["planner/high_actor_updated"] = jnp.asarray(
+                high_actor_is_active, dtype=jnp.float32
+            )
             metrics["gradient_steps"] = training_state.gradient_steps
             return (training_state, key), metrics
 
@@ -918,6 +1065,65 @@ class HCARL:
                 batches,
             )
             return buffer_state, batches
+
+        @jax.jit
+        def sample_carl_representations(critic_params, buffer_state, sample_key):
+            """Samples matched CARL positives for host-side PCA visualization.
+
+            The replay state returned by sample() is deliberately discarded so
+            that enabling this diagnostic never changes subsequent training
+            batches or the training random-number sequence.
+            """
+            _, transitions = replay_buffer.sample(buffer_state)
+            relabel_key, select_key = jax.random.split(sample_key)
+            batch_keys = jax.random.split(relabel_key, transitions.observation.shape[0])
+            batches = jax.vmap(flatten_batch_hcrl)(transitions, batch_keys)
+            batches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"),
+                batches,
+            )
+
+            total_pairs = batches.observation.shape[0]
+            num_pairs = min(int(self.representation_viz_max_points), total_pairs)
+            selected = jax.random.permutation(select_key, total_pairs)[:num_pairs]
+
+            state = batches.extras["state"][selected]
+            low_goal = batches.extras["low_actor_goal"][selected]
+            action_sequence = batches.extras["action_sequence"][selected]
+
+            state_goal_repr = sg_encoder_module.apply(
+                critic_params["sg_encoder"],
+                jnp.concatenate([state, low_goal], axis=-1),
+            )
+            action_repr = a_encoder_module.apply(
+                critic_params["a_encoder"],
+                action_sequence,
+            )
+            goal_delta = low_goal - state[:, _goal_indices_arr]
+
+            shuffled_action_repr = jnp.roll(action_repr, shift=1, axis=0)
+            positive_l2 = jnp.linalg.norm(state_goal_repr - action_repr, axis=-1)
+            shuffled_l2 = jnp.linalg.norm(
+                state_goal_repr - shuffled_action_repr, axis=-1
+            )
+            cosine_similarity = jnp.sum(state_goal_repr * action_repr, axis=-1) / (
+                jnp.linalg.norm(state_goal_repr, axis=-1)
+                * jnp.linalg.norm(action_repr, axis=-1)
+                + 1e-8
+            )
+            representation_metrics = {
+                "carl_repr/positive_l2": jnp.mean(positive_l2),
+                "carl_repr/shuffled_l2": jnp.mean(shuffled_l2),
+                "carl_repr/l2_margin": jnp.mean(shuffled_l2 - positive_l2),
+                "carl_repr/positive_cosine": jnp.mean(cosine_similarity),
+                "carl_repr/state_goal_norm": jnp.mean(
+                    jnp.linalg.norm(state_goal_repr, axis=-1)
+                ),
+                "carl_repr/action_sequence_norm": jnp.mean(
+                    jnp.linalg.norm(action_repr, axis=-1)
+                ),
+            }
+            return state_goal_repr, action_repr, goal_delta, representation_metrics
 
         @jax.jit
         def replay_update_step(training_state, buffer_state, key):
@@ -1151,6 +1357,38 @@ class HCARL:
 
             do_render = ne % config.visualization_interval == 0
             make_policy = _make_policy
+
+            if self.log_representation_space and do_render:
+                # Fold in the step rather than splitting the training key, so diagnostics do not perturb the learning trajectory.
+                representation_key = jax.random.fold_in(
+                    jax.random.PRNGKey(config.seed),
+                    current_step,
+                )
+                state_goal_repr, action_repr, goal_delta, representation_metrics = (
+                    sample_carl_representations(
+                        training_state.critic_state.params,
+                        buffer_state,
+                        representation_key,
+                    )
+                )
+                representation_metrics = jax.tree_util.tree_map(lambda x: float(jnp.asarray(x).block_until_ready()), representation_metrics)
+                metrics.update(representation_metrics)
+
+                representation_figure = make_carl_representation_figure(
+                    np.asarray(jax.device_get(state_goal_repr)),
+                    np.asarray(jax.device_get(action_repr)),
+                    np.asarray(jax.device_get(goal_delta)),
+                    self.representation_viz_num_links,
+                )
+                wandb.log(
+                    {
+                        "carl_representation_space": wandb.Image(
+                            representation_figure
+                        )
+                    },
+                    step=current_step,
+                )
+                plt.close(representation_figure)
 
             if _coverage_history:
                 all_pos = np.concatenate(_coverage_history, axis=0)
