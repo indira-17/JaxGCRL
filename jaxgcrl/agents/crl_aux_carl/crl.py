@@ -546,7 +546,7 @@ class CRLAuxCARL:
             use_relu=self.use_relu,
             use_ln=self.use_ln,
         )
-        g_encoder_params = g_encoder.init(g_key, np.ones([1, goal_size]))
+        g_encoder_params = g_encoder.init(g_key, np.ones([1, self.carl_repr_dim]))
         critic_state = TrainState.create(
             apply_fn=None,
             params={"sa_encoder": sa_encoder_params, "g_encoder": g_encoder_params},
@@ -832,9 +832,13 @@ class CRLAuxCARL:
                 critic_params["sa_encoder"],
                 jnp.concatenate([state, action], axis=-1),
             )
+            crl_sg_repr = sg_encoder.apply(
+                carl_params["sg_encoder"],
+                jnp.concatenate([state, crl_goal], axis=-1),
+            )
             crl_goal_repr = g_encoder.apply(
                 critic_params["g_encoder"],
-                crl_goal,
+                crl_sg_repr,
             )
             carl_sg_repr = sg_encoder.apply(
                 carl_params["sg_encoder"],
