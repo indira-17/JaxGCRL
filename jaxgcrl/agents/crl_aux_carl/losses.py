@@ -72,7 +72,7 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
             sa_encoder_params,
             jnp.concatenate([state, action], axis=-1),
         )
-        g_repr = networks["g_encoder"].apply(g_encoder_params, sg_repr)
+        g_repr = networks["g_encoder"].apply(g_encoder_params, goal)
         qf_pi = energy_fn(config["energy_fn"], sa_repr, g_repr)
 
         actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
@@ -128,19 +128,19 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
 
 
 def update_critic(config, networks, transitions, training_state, key):
-    def critic_loss(critic_params, sg_encoder_params, transitions, key):
+    def critic_loss(critic_params, transitions, key):
         sa_encoder_params, g_encoder_params = (
             critic_params["sa_encoder"],
             critic_params["g_encoder"],
         )
 
         state = transitions.observation[:, : config["state_size"]]
-        goal = transitions.observation[:, config["state_size"] :]
         action = transitions.action
 
         sa_repr = networks["sa_encoder"].apply(sa_encoder_params, jnp.concatenate([state, action], axis=-1))
-        sg_repr = networks["sg_encoder"].apply(sg_encoder_params, jnp.concatenate([state, goal], axis=-1))
-        g_repr = networks["g_encoder"].apply(g_encoder_params, sg_repr)
+        g_repr = networks["g_encoder"].apply(
+            g_encoder_params, transitions.observation[:, config["state_size"] :]
+        )
 
         # InfoNCE
         logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
@@ -157,29 +157,11 @@ def update_critic(config, networks, transitions, training_state, key):
 
         return critic_loss, (logsumexp, I, correct, logits_pos, logits_neg)
 
-    (loss, (logsumexp, I, correct, logits_pos, logits_neg)), (critic_grad, sg_grad) = jax.value_and_grad(
-        critic_loss, argnums=(0, 1), has_aux=True
-    )(
-        training_state.critic_state.params,
-        training_state.carl_state.params["sg_encoder"],
-        transitions,
-        key,
-    )
-    new_critic_state = training_state.critic_state.apply_gradients(grads=critic_grad)
-
-    critic_carl_grads = {
-        "sg_encoder": sg_grad,
-        "a_encoder": jax.tree_util.tree_map(
-            jnp.zeros_like,
-            training_state.carl_state.params["a_encoder"],
-        ),
-    }
-    new_carl_state = training_state.carl_state.apply_gradients(grads=critic_carl_grads)
-
-    training_state = training_state.replace(
-        critic_state=new_critic_state,
-        carl_state=new_carl_state,
-    )
+    (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
+        critic_loss, has_aux=True
+    )(training_state.critic_state.params, transitions, key)
+    new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
+    training_state = training_state.replace(critic_state=new_critic_state)
 
     metrics = {
         "categorical_accuracy": jnp.mean(correct),
