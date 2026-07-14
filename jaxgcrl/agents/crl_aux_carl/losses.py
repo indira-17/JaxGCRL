@@ -34,25 +34,21 @@ def contrastive_loss_fn(name, logits):
 
 
 def update_actor_and_alpha(config, networks, transitions, training_state, key):
-    """SAC/CRL actor update conditioned on [state, CARL phi(state, goal)].
+    """SAC/CRL actor update conditioned on [state, phi(state, local_goal)].
 
-    The CRL critic stays fixed during this actor update.  The CARL state-goal
-    encoder is differentiated jointly with the actor, so it receives the actor
-    gradient through the action sampled from pi(a | s, phi(s, g)).  The CARL
-    action-sequence encoder remains untouched by this update and is trained
-    only by update_carl_aux.
+    The CRL critic stays fixed during this update. The state-goal encoder is
+    updated only through the actor objective. The action-sequence encoder is
+    frozen and receives no gradients.
     """
 
     def actor_loss(actor_params, sg_encoder_params, critic_params, log_alpha, transitions, key):
         obs = transitions.observation
         state = obs[:, : config["state_size"]]
-        future_state = transitions.extras["future_state"]
-        goal = future_state[:, config["goal_indices"]]
+        local_goal = obs[:, config["state_size"] :]
 
-        # The actor's goal input is the CARL state-goal representation.
         sg_repr = networks["sg_encoder"].apply(
             sg_encoder_params,
-            jnp.concatenate([state, goal], axis=-1),
+            jnp.concatenate([state, local_goal], axis=-1),
         )
         observation = jnp.concatenate([state, sg_repr], axis=-1)
 
@@ -72,7 +68,7 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
             sa_encoder_params,
             jnp.concatenate([state, action], axis=-1),
         )
-        g_repr = networks["g_encoder"].apply(g_encoder_params, goal)
+        g_repr = networks["g_encoder"].apply(g_encoder_params, local_goal)
         qf_pi = energy_fn(config["energy_fn"], sa_repr, g_repr)
 
         actor_loss = jnp.mean(jnp.exp(log_alpha) * log_prob - qf_pi)
@@ -97,7 +93,6 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
     )
     new_actor_state = training_state.actor_state.apply_gradients(grads=actor_grad)
 
-    # Keep the existing independent CARL optimizer.
     actor_carl_grads = {
         "sg_encoder": sg_grad,
         "a_encoder": jax.tree_util.tree_map(
@@ -107,7 +102,10 @@ def update_actor_and_alpha(config, networks, transitions, training_state, key):
     }
     new_carl_state = training_state.carl_state.apply_gradients(grads=actor_carl_grads)
 
-    alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss)(training_state.alpha_state.params, log_prob)
+    alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss)(
+        training_state.alpha_state.params,
+        log_prob,
+    )
     new_alpha_state = training_state.alpha_state.apply_gradients(grads=alpha_grad)
 
     training_state = training_state.replace(
@@ -137,16 +135,18 @@ def update_critic(config, networks, transitions, training_state, key):
         state = transitions.observation[:, : config["state_size"]]
         action = transitions.action
 
-        sa_repr = networks["sa_encoder"].apply(sa_encoder_params, jnp.concatenate([state, action], axis=-1))
+        sa_repr = networks["sa_encoder"].apply(
+            sa_encoder_params,
+            jnp.concatenate([state, action], axis=-1),
+        )
         g_repr = networks["g_encoder"].apply(
-            g_encoder_params, transitions.observation[:, config["state_size"] :]
+            g_encoder_params,
+            transitions.observation[:, config["state_size"] :],
         )
 
-        # InfoNCE
         logits = energy_fn(config["energy_fn"], sa_repr[:, None, :], g_repr[None, :, :])
         critic_loss = contrastive_loss_fn(config["contrastive_loss_fn"], logits)
 
-        # logsumexp regularisation
         logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
         critic_loss += config["logsumexp_penalty_coeff"] * jnp.mean(logsumexp**2)
 
@@ -158,7 +158,8 @@ def update_critic(config, networks, transitions, training_state, key):
         return critic_loss, (logsumexp, I, correct, logits_pos, logits_neg)
 
     (loss, (logsumexp, I, correct, logits_pos, logits_neg)), grad = jax.value_and_grad(
-        critic_loss, has_aux=True
+        critic_loss,
+        has_aux=True,
     )(training_state.critic_state.params, transitions, key)
     new_critic_state = training_state.critic_state.apply_gradients(grads=grad)
     training_state = training_state.replace(critic_state=new_critic_state)
@@ -175,42 +176,23 @@ def update_critic(config, networks, transitions, training_state, key):
 
 
 def update_carl_aux(config, networks, transitions, training_state):
-    """Updates only the auxiliary CARL encoders."""
+    """CARL auxiliary update disabled.
 
-    state = transitions.extras["state"]
-    carl_goal = transitions.extras["carl_goal"]
-    action_sequence = transitions.extras["action_sequence"]
+    The state-goal encoder is updated only inside update_actor_and_alpha using
+    the actor gradient. This function intentionally performs no optimizer step,
+    so CARL gradients and Adam momentum from a second CARL update cannot change
+    either encoder.
+    """
+    del config, networks, transitions
 
-    def carl_loss(carl_params):
-        sg_repr = networks["sg_encoder"].apply(
-            carl_params["sg_encoder"],
-            jnp.concatenate([state, carl_goal], axis=-1),
-        )
-        a_repr = networks["a_encoder"].apply(carl_params["a_encoder"], action_sequence)
-
-        logits = energy_fn(config["energy_fn"], sg_repr[:, None, :], a_repr[None, :, :])
-        infonce_loss = contrastive_loss_fn(config["contrastive_loss_fn"], logits)
-        logsumexp = jax.nn.logsumexp(logits + 1e-6, axis=1)
-        logsumexp_penalty = jnp.mean(logsumexp**2)
-        loss = infonce_loss + config["logsumexp_penalty_coeff"] * logsumexp_penalty
-
-        eye = jnp.eye(logits.shape[0])
-        correct = jnp.argmax(logits, axis=1) == jnp.arange(logits.shape[0])
-        logits_pos = jnp.sum(logits * eye) / jnp.sum(eye)
-        logits_neg = jnp.sum(logits * (1.0 - eye)) / jnp.sum(1.0 - eye)
-        return loss, {
-            "carl_loss": loss,
-            "carl_infonce_loss": infonce_loss,
-            "carl_logsumexp_penalty": logsumexp_penalty,
-            "carl_categorical_accuracy": jnp.mean(correct),
-            "carl_logits_pos": logits_pos,
-            "carl_logits_neg": logits_neg,
-            "carl_logit_gap": logits_pos - logits_neg,
-        }
-
-    (loss, metrics), grad = jax.value_and_grad(carl_loss, has_aux=True)(
-        training_state.carl_state.params
-    )
-    del loss
-    carl_state = training_state.carl_state.apply_gradients(grads=grad)
-    return training_state.replace(carl_state=carl_state), metrics
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+    metrics = {
+        "carl_loss": zero,
+        "carl_infonce_loss": zero,
+        "carl_logsumexp_penalty": zero,
+        "carl_categorical_accuracy": zero,
+        "carl_logits_pos": zero,
+        "carl_logits_neg": zero,
+        "carl_logit_gap": zero,
+    }
+    return training_state, metrics

@@ -283,17 +283,20 @@ def flatten_batch(buffer_config, transition, sample_key):
         transition.observation, goal_index[:-1], axis=0
     )  # the last goal_index cannot be considered as there is no future.
     future_action = jnp.take(transition.action, goal_index[:-1], axis=0)
-    goal = future_state[:, goal_indices]
+    future_goal = future_state[:, goal_indices]
     future_state = future_state[:, :state_size]
     state = transition.observation[:-1, :state_size]  # all states are considered
-    new_obs = jnp.concatenate([state, goal], axis=1)
 
     same_traj = jnp.equal(single_trajectories, single_trajectories.T)
     big_neg = jnp.where(same_traj, arrangement[None, :], -1)
     final_idx = jnp.max(big_neg, axis=1)
     current_idx = arrangement[:-1]
     short_goal_idx = jnp.minimum(current_idx + carl_subgoal_steps, final_idx[:-1])
-    carl_goal = transition.observation[short_goal_idx][:, goal_indices]
+    local_goal = transition.observation[short_goal_idx][:, goal_indices]
+
+    # Train both the actor and the CRL critic on the same achieved K-step goal.
+    # The oracle planner is used only during collection and evaluation.
+    new_obs = jnp.concatenate([state, local_goal], axis=1)
 
     action_offsets = jnp.arange(carl_subgoal_steps)
     action_idx = jnp.minimum(
@@ -312,8 +315,10 @@ def flatten_batch(buffer_config, transition, sample_key):
         },
         "state": state,
         "future_state": future_state,
+        "future_goal": future_goal,
         "future_action": future_action,
-        "carl_goal": carl_goal,
+        "local_goal": local_goal,
+        "carl_goal": local_goal,
         "action_sequence": action_sequence,
     }
 
@@ -340,7 +345,7 @@ def save_params(path: str, params: Any):
 
 @dataclass
 class CRLAuxCARL:
-    """CRL control with an auxiliary CARL representation loss."""
+    """CRL control with an actor-trained state-goal representation."""
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
@@ -562,10 +567,9 @@ class CRLAuxCARL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
-        # CARL encoders.  phi(s, goal) conditions the CRL/SAC actor and is
-        # updated by both the actor objective and the CARL InfoNCE objective.
-        # The action-sequence encoder remains auxiliary and is updated only by
-        # CARL InfoNCE.
+        # The state-goal encoder conditions the CRL/SAC actor and is updated
+        # only through the actor objective. The action-sequence encoder is kept
+        # only for parameter-tree compatibility and remains frozen.
         sg_encoder = Encoder(
             repr_dim=self.carl_repr_dim,
             network_width=self.h_dim,
@@ -783,9 +787,14 @@ class CRLAuxCARL:
             metrics.update(carl_metrics)
             if _use_planner:
                 state = transitions.extras["state"]
-                final_goal = transitions.observation[:, state_size:]
-                subgoal = oracle_subgoal(state, final_goal, _goal_indices_tuple, self.planner_mode, self.planner_step_size)
-                metrics.update(planner_metrics(state, final_goal, subgoal, _goal_indices_tuple))
+                local_goal = transitions.observation[:, state_size:]
+                current_goal_state = state[:, _goal_indices_arr]
+                metrics["planner/training_local_goal_distance"] = jnp.mean(
+                    jnp.linalg.norm(local_goal - current_goal_state, axis=-1)
+                )
+                metrics["planner/configured_step_size"] = jnp.asarray(
+                    self.planner_step_size, dtype=jnp.float32
+                )
 
             return (training_state, key), metrics
 
