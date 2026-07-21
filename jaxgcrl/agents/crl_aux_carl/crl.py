@@ -24,8 +24,14 @@ from jaxgcrl.envs.wrappers import TrajectoryIdWrapper
 from jaxgcrl.utils.evaluator import ActorEvaluator
 from jaxgcrl.utils.replay_buffer import TrajectoryUniformSamplingQueue
 
-from .losses import update_actor_and_alpha, update_carl_aux, update_critic
-from .networks import Actor, Encoder
+from .losses import (
+    update_actor_and_alpha,
+    update_backward_dynamics,
+    update_carl_aux,
+    update_critic,
+    update_forward_dynamics,
+)
+from .networks import Actor, BackwardDynamics, Encoder, ForwardDynamics
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs.Wrapper]
@@ -42,6 +48,8 @@ class TrainingState:
     critic_state: TrainState
     alpha_state: TrainState
     carl_state: TrainState
+    fd_state: TrainState
+    bd_state: TrainState
 
 
 class Transition(NamedTuple):
@@ -52,6 +60,78 @@ class Transition(NamedTuple):
     reward: jnp.ndarray
     discount: jnp.ndarray
     extras: jnp.ndarray = ()
+
+
+class CARLPairs(NamedTuple):
+    """Real CARL anchors plus backward-generated, forward-validated pairs."""
+
+    state: jnp.ndarray
+    goal: jnp.ndarray
+    real_action_sequence: jnp.ndarray
+    generated_action_sequence: jnp.ndarray
+    negative_action_sequence: jnp.ndarray
+    generated_positive_mask: jnp.ndarray
+    negative_mask: jnp.ndarray
+    valid_mask: jnp.ndarray
+
+
+def create_carl_pairs(
+    backward_dynamics,
+    bd_params,
+    forward_dynamics,
+    fd_params,
+    transitions,
+    key,
+    positive_margin: float,
+    negative_margin: float,
+    proposal_noise_scale: float,
+):
+    """Proposal-verification pair construction for CARL.
+
+    1) (s, g, A_real) is always a real positive from replay.
+    2) q(A | s, g) proposes A_gen. F(s, A_gen) must predict g before it
+       becomes an additional positive.
+    3) A validated proposal from another row is borrowed as A_neg. It becomes
+       a negative only if F(s, A_neg) predicts an outcome clearly away from g.
+    """
+    state = transitions.extras["state"]
+    goal = transitions.extras["carl_goal"]
+    real_action = transitions.extras["action_sequence"]
+    valid_mask = transitions.extras["carl_valid"]
+
+    mean, log_std = backward_dynamics.apply(bd_params, state, goal)
+    noise = jax.random.normal(key, mean.shape, dtype=mean.dtype)
+    generated_action = jnp.clip(
+        mean + float(proposal_noise_scale) * jnp.exp(log_std) * noise,
+        -1.0,
+        1.0,
+    )
+
+    generated_goal = forward_dynamics.apply(fd_params, state, generated_action)
+    generated_distance = jnp.linalg.norm(generated_goal - goal, axis=-1)
+    generated_positive_mask = (generated_distance <= positive_margin) & valid_mask
+
+    # Only lend a model-generated action to another pair if it passed its own
+    # forward check. Otherwise lend the real replay action from that row.
+    verified_source_action = jnp.where(
+        generated_positive_mask[:, None], generated_action, real_action
+    )
+    negative_action = jnp.roll(verified_source_action, shift=1, axis=0)
+    negative_goal = forward_dynamics.apply(fd_params, state, negative_action)
+    negative_distance = jnp.linalg.norm(negative_goal - goal, axis=-1)
+    source_valid = jnp.roll(valid_mask, shift=1, axis=0)
+    negative_mask = (negative_distance >= negative_margin) & valid_mask & source_valid
+
+    return CARLPairs(
+        state=jax.lax.stop_gradient(state),
+        goal=jax.lax.stop_gradient(goal),
+        real_action_sequence=jax.lax.stop_gradient(real_action),
+        generated_action_sequence=jax.lax.stop_gradient(generated_action),
+        negative_action_sequence=jax.lax.stop_gradient(negative_action),
+        generated_positive_mask=jax.lax.stop_gradient(generated_positive_mask),
+        negative_mask=jax.lax.stop_gradient(negative_mask),
+        valid_mask=jax.lax.stop_gradient(valid_mask),
+    )
 
 
 # The planner is kept in this file so this CRL + auxiliary-CARL agent can run
@@ -291,6 +371,7 @@ def flatten_batch(buffer_config, transition, sample_key):
     big_neg = jnp.where(same_traj, arrangement[None, :], -1)
     final_idx = jnp.max(big_neg, axis=1)
     current_idx = arrangement[:-1]
+    carl_valid = current_idx + carl_subgoal_steps <= final_idx[:-1]
     short_goal_idx = jnp.minimum(current_idx + carl_subgoal_steps, final_idx[:-1])
     local_goal = transition.observation[short_goal_idx][:, goal_indices]
 
@@ -319,6 +400,7 @@ def flatten_batch(buffer_config, transition, sample_key):
         "future_action": future_action,
         "local_goal": local_goal,
         "carl_goal": local_goal,
+        "carl_valid": carl_valid,
         "action_sequence": action_sequence,
     }
 
@@ -345,12 +427,14 @@ def save_params(path: str, params: Any):
 
 @dataclass
 class CRLAuxCARL:
-    """CRL control with an actor-trained state-goal representation."""
+    """CRL control with a separately trained CARL state-goal representation."""
 
     policy_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     carl_lr: float = 3e-4
+    fd_lr: float = 3e-4
+    bd_lr: float = 3e-4
     batch_size: int = 256
 
     # gamma
@@ -375,6 +459,10 @@ class CRLAuxCARL:
     repr_dim: int = 64
     carl_repr_dim: int = 64
     carl_subgoal_steps: int = 25
+    carl_positive_margin: float = 0.10
+    carl_negative_margin: float = 0.25
+    carl_proposal_noise_scale: float = 1.0
+    carl_generated_weight: float = 0.25
 
     # layer norm
     use_ln: bool = False
@@ -469,9 +557,19 @@ class CRLAuxCARL:
         random.seed(config.seed)
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
-        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key, sg_key, a_key = jax.random.split(
-            key, 9
-        )
+        (
+            key,
+            buffer_key,
+            eval_env_key,
+            env_key,
+            actor_key,
+            sa_key,
+            g_key,
+            sg_key,
+            a_key,
+            fd_key,
+            bd_key,
+        ) = jax.random.split(key, 11)
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -522,13 +620,13 @@ class CRLAuxCARL:
             skip_connections=self.skip_connections,
             use_relu=self.use_relu,
         )
-        # The flat SAC/CRL actor is conditioned on raw state plus the CARL
-        # state-goal representation, not on raw goal coordinates.
+        # The flat SAC/CRL actor is conditioned on raw state, raw local goal,
+        # and the CARL state-goal representation.
         actor_state = TrainState.create(
             apply_fn=actor.apply,
             params=actor.init(
                 actor_key,
-                np.ones([1, state_size + self.carl_repr_dim]),
+                np.ones([1, state_size + goal_size + self.carl_repr_dim]),
             ),
             tx=optax.adam(learning_rate=self.policy_lr),
         )
@@ -567,9 +665,9 @@ class CRLAuxCARL:
             tx=optax.adam(learning_rate=self.alpha_lr),
         )
 
-        # The state-goal encoder conditions the CRL/SAC actor and is updated
-        # only through the actor objective. The action-sequence encoder is kept
-        # only for parameter-tree compatibility and remains frozen.
+        # CARL learns a state-goal/action-sequence reachability representation.
+        # The actor consumes the state-goal representation but does not backpropagate
+        # into either CARL encoder.
         sg_encoder = Encoder(
             repr_dim=self.carl_repr_dim,
             network_width=self.h_dim,
@@ -595,6 +693,38 @@ class CRLAuxCARL:
             tx=optax.adam(learning_rate=self.carl_lr),
         )
 
+        forward_dynamics = ForwardDynamics(
+            goal_size=goal_size,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            use_relu=self.use_relu,
+        )
+        fd_state = TrainState.create(
+            apply_fn=forward_dynamics.apply,
+            params=forward_dynamics.init(
+                fd_key,
+                np.ones([1, state_size]),
+                np.ones([1, self.carl_subgoal_steps * action_size]),
+            ),
+            tx=optax.adam(learning_rate=self.fd_lr),
+        )
+
+        backward_dynamics = BackwardDynamics(
+            action_sequence_size=self.carl_subgoal_steps * action_size,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            use_relu=self.use_relu,
+        )
+        bd_state = TrainState.create(
+            apply_fn=backward_dynamics.apply,
+            params=backward_dynamics.init(
+                bd_key,
+                np.ones([1, state_size]),
+                np.ones([1, goal_size]),
+            ),
+            tx=optax.adam(learning_rate=self.bd_lr),
+        )
+
         # Trainstate
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
@@ -603,6 +733,8 @@ class CRLAuxCARL:
             critic_state=critic_state,
             alpha_state=alpha_state,
             carl_state=carl_state,
+            fd_state=fd_state,
+            bd_state=bd_state,
         )
 
         # Replay Buffer
@@ -639,7 +771,7 @@ class CRLAuxCARL:
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
         def _planned_actor_observation(raw_obs, sg_encoder_params):
-            """Builds [state, phi_CARL(state, local goal)] for the flat actor.
+            """Builds [state, local goal, phi_CARL(state, local goal)] for the flat actor.
 
             With ``planner_mode='ant_xy_oracle'`` the local goal is the oracle
             XY waypoint.  There is no high actor in this CRL + CARL-aux agent,
@@ -652,7 +784,7 @@ class CRLAuxCARL:
                 sg_encoder_params,
                 jnp.concatenate([state, actor_goal], axis=-1),
             )
-            return jnp.concatenate([state, sg_repr], axis=-1)
+            return jnp.concatenate([state, actor_goal, sg_repr], axis=-1)
 
         def deterministic_actor_step(training_state, env, env_state, extra_fields):
             actor_obs = _planned_actor_observation(
@@ -768,16 +900,44 @@ class CRLAuxCARL:
                 g_encoder=g_encoder,
                 sg_encoder=sg_encoder,
                 a_encoder=a_encoder,
+                forward_dynamics=forward_dynamics,
+                backward_dynamics=backward_dynamics,
             )
 
+            # 1) Learn both directions of the local K-step dynamics from real
+            #    replay tuples only.
+            training_state, fd_metrics = update_forward_dynamics(
+                context, networks, transitions, training_state
+            )
+            training_state, bd_metrics = update_backward_dynamics(
+                context, networks, transitions, training_state
+            )
+
+            # 2) Backward model proposes A ~ q(A | s, g). Forward model verifies
+            #    generated positives and verifies borrowed proposals as negatives.
+            key, proposal_key = jax.random.split(key)
+            carl_pairs = create_carl_pairs(
+                backward_dynamics,
+                training_state.bd_state.params,
+                forward_dynamics,
+                training_state.fd_state.params,
+                transitions,
+                proposal_key,
+                self.carl_positive_margin,
+                self.carl_negative_margin,
+                self.carl_proposal_noise_scale,
+            )
+            training_state, carl_metrics = update_carl_aux(
+                context, networks, carl_pairs, training_state
+            )
+
+            # 3) The actor consumes CARL features, but actor gradients do not
+            #    update the CARL encoder.
             training_state, actor_metrics = update_actor_and_alpha(
                 context, networks, transitions, training_state, actor_key
             )
             training_state, critic_metrics = update_critic(
                 context, networks, transitions, training_state, critic_key
-            )
-            training_state, carl_metrics = update_carl_aux(
-                context, networks, transitions, training_state
             )
             training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
@@ -785,6 +945,8 @@ class CRLAuxCARL:
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
             metrics.update(carl_metrics)
+            metrics.update(fd_metrics)
+            metrics.update(bd_metrics)
             if _use_planner:
                 state = transitions.extras["state"]
                 local_goal = transitions.observation[:, state_size:]
@@ -1045,6 +1207,8 @@ class CRLAuxCARL:
                 training_state.actor_state.params,
                 training_state.critic_state.params,
                 training_state.carl_state.params,
+                training_state.fd_state.params,
+                training_state.bd_state.params,
             )
 
             if self.log_representation_space and do_render:
