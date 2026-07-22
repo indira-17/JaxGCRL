@@ -28,8 +28,9 @@ from .losses import (
     update_actor_and_alpha,
     update_carl_aux,
     update_critic,
+    update_forward_dynamics,
 )
-from .networks import Actor, Encoder
+from .networks import Actor, Encoder, ForwardDynamics
 
 Metrics = types.Metrics
 Env = Union[envs.Env, envs.Wrapper]
@@ -41,12 +42,12 @@ class TrainingState:
     """Contains training state for the learner"""
 
     env_steps: jnp.ndarray
-    carl_env_steps: jnp.ndarray
     gradient_steps: jnp.ndarray
     actor_state: TrainState
     critic_state: TrainState
     alpha_state: TrainState
     carl_state: TrainState
+    fd_state: TrainState
 
 
 class Transition(NamedTuple):
@@ -60,113 +61,118 @@ class Transition(NamedTuple):
 
 
 class CARLPairs(NamedTuple):
+    """Candidate action sequences ranked by predicted goal-reaching quality."""
+
     state: jnp.ndarray
     goal: jnp.ndarray
     candidate_action_sequences: jnp.ndarray
     positive_mask: jnp.ndarray
     negative_mask: jnp.ndarray
-    environment_distance: jnp.ndarray
+    model_distance: jnp.ndarray
     valid_mask: jnp.ndarray
 
 
-class CARLReplayPool(NamedTuple):
-    state: jnp.ndarray
-    goal: jnp.ndarray
-    action_sequence: jnp.ndarray
-    valid: jnp.ndarray
-
-
-class CARLAnchorPool(NamedTuple):
-    state: jnp.ndarray
-    goal: jnp.ndarray
-    action_sequence: jnp.ndarray
-    valid: jnp.ndarray
-    env_state: Any
-
-
-def build_environment_carl_pairs(
-    state,
-    goal,
-    candidate_action_sequences,
-    achieved_goals,
-    candidate_valid,
-    num_positives,
-    num_negatives,
+def create_carl_pairs(
+    forward_dynamics,
+    fd_params,
+    transitions,
+    key,
+    num_candidates: int,
+    num_positives: int,
+    num_negatives: int,
+    candidate_noise_scale: float,
 ):
-    distance = jnp.linalg.norm(achieved_goals - goal[:, None, :], axis=-1)
-    valid_mask = candidate_valid[:, 0]
-    eligible = candidate_valid & valid_mask[:, None]
-    rows = jnp.arange(state.shape[0])[:, None]
+    """Score candidate action sequences for each real state-goal pair.
 
+    The real replay action is always candidate 0 and a guaranteed positive.
+    The remaining candidates are action sequences taken from other replay rows
+    in the minibatch, optionally perturbed with small exploration noise.
+    F(s, A) predicts the achieved goal; candidates closest to g are positives
+    and candidates farthest from g are negatives.
+    """
+    state = transitions.extras["state"]
+    goal = transitions.extras["carl_goal"]
+    real_action = transitions.extras["action_sequence"]
+    valid_mask = transitions.extras["carl_valid"]
+
+    batch_size = real_action.shape[0]
+    key, index_key, noise_key = jax.random.split(key, 3)
+
+    # Candidate 0 is the action sequence that actually realized (s, g).
+    # Other candidates come from different replay state-goal pairs.
+    offsets = jax.random.randint(
+        index_key,
+        shape=(batch_size, num_candidates - 1),
+        minval=1,
+        maxval=batch_size,
+    )
+    candidate_indices = (
+        jnp.arange(batch_size)[:, None] + offsets
+    ) % batch_size
+    other_actions = real_action[candidate_indices]
+
+    noise = jax.random.normal(noise_key, other_actions.shape, dtype=other_actions.dtype)
+    other_actions = jnp.clip(
+        other_actions + float(candidate_noise_scale) * noise,
+        -1.0,
+        1.0,
+    )
+    candidate_actions = jnp.concatenate(
+        [real_action[:, None, :], other_actions], axis=1
+    )
+
+    # Do not rank padded/incomplete K-step action sequences.
+    source_valid = jnp.concatenate(
+        [valid_mask[:, None], valid_mask[candidate_indices]], axis=1
+    )
+    eligible = valid_mask[:, None] & source_valid
+
+    repeated_state = jnp.repeat(state[:, None, :], num_candidates, axis=1)
+    predicted_goal = forward_dynamics.apply(
+        fd_params,
+        repeated_state.reshape((-1, state.shape[-1])),
+        candidate_actions.reshape((-1, real_action.shape[-1])),
+    ).reshape((batch_size, num_candidates, goal.shape[-1]))
+    distance = jnp.linalg.norm(predicted_goal - goal[:, None, :], axis=-1)
+
+    rows = jnp.arange(batch_size)[:, None]
+
+    # The real replay action is always a positive anchor. Add the closest
+    # model-scored alternatives as additional positives.
     positive_mask = jnp.zeros_like(distance, dtype=jnp.bool_)
     positive_mask = positive_mask.at[:, 0].set(valid_mask)
-
     if num_positives > 1:
-        positive_distance = jnp.where(eligible.at[:, 0].set(False), distance, jnp.inf)
+        positive_distance = jnp.where(
+            eligible.at[:, 0].set(False), distance, jnp.inf
+        )
         positive_indices = jnp.argsort(positive_distance, axis=1)[:, : num_positives - 1]
-        positive_valid = jnp.take_along_axis(eligible.at[:, 0].set(False), positive_indices, axis=1)
-        positive_mask = positive_mask.at[rows, positive_indices].set(positive_valid)
+        selected_positive_valid = jnp.take_along_axis(
+            eligible, positive_indices, axis=1
+        )
+        positive_mask = positive_mask.at[rows, positive_indices].set(
+            selected_positive_valid
+        )
 
+    # Negatives are the farthest valid candidates, excluding all positives.
     negative_eligible = eligible & ~positive_mask
     negative_distance = jnp.where(negative_eligible, distance, -jnp.inf)
     negative_indices = jnp.argsort(-negative_distance, axis=1)[:, :num_negatives]
-    negative_valid = jnp.take_along_axis(negative_eligible, negative_indices, axis=1)
+    selected_negative_valid = jnp.take_along_axis(
+        negative_eligible, negative_indices, axis=1
+    )
     negative_mask = jnp.zeros_like(distance, dtype=jnp.bool_)
-    negative_mask = negative_mask.at[rows, negative_indices].set(negative_valid)
-
-    valid_mask = valid_mask & jnp.any(negative_mask, axis=1)
+    negative_mask = negative_mask.at[rows, negative_indices].set(
+        selected_negative_valid
+    )
 
     return CARLPairs(
         state=jax.lax.stop_gradient(state),
         goal=jax.lax.stop_gradient(goal),
-        candidate_action_sequences=jax.lax.stop_gradient(
-            candidate_action_sequences
-        ),
+        candidate_action_sequences=jax.lax.stop_gradient(candidate_actions),
         positive_mask=jax.lax.stop_gradient(positive_mask),
         negative_mask=jax.lax.stop_gradient(negative_mask),
-        environment_distance=jax.lax.stop_gradient(distance),
+        model_distance=jax.lax.stop_gradient(distance),
         valid_mask=jax.lax.stop_gradient(valid_mask),
-    )
-
-
-@functools.partial(jax.jit, static_argnames=("buffer_config",))
-def extract_carl_replay_windows(buffer_config, transition):
-    state_size, goal_indices, carl_subgoal_steps = buffer_config
-    seq_len = transition.observation.shape[0]
-    idx = jnp.arange(seq_len)
-
-    traj_id = transition.extras["state_extras"]["traj_id"]
-    same_traj = traj_id[:, None] == traj_id[None, :]
-    final_idx = jnp.max(jnp.where(same_traj, idx[None, :], -1), axis=1)
-
-    current_idx = idx[:-1]
-    valid = current_idx + carl_subgoal_steps <= final_idx[:-1]
-    goal_idx = jnp.minimum(current_idx + carl_subgoal_steps, final_idx[:-1])
-
-    action_idx = current_idx[:, None] + jnp.arange(carl_subgoal_steps)
-    action_idx = jnp.minimum(
-        action_idx,
-        jnp.maximum(final_idx[:-1, None] - 1, current_idx[:, None]),
-    )
-    action_idx = jnp.minimum(action_idx, seq_len - 2)
-
-    return CARLReplayPool(
-        state=transition.observation[:-1, :state_size],
-        goal=transition.observation[goal_idx][:, goal_indices],
-        action_sequence=jnp.take(transition.action, action_idx, axis=0),
-        valid=valid,
-    )
-
-
-@functools.partial(jax.jit, static_argnames=("buffer_config",))
-def extract_carl_anchor_windows(buffer_config, transition, env_state):
-    replay_pool = extract_carl_replay_windows(buffer_config, transition)
-    return CARLAnchorPool(
-        state=replay_pool.state,
-        goal=replay_pool.goal,
-        action_sequence=replay_pool.action_sequence,
-        valid=replay_pool.valid,
-        env_state=jax.tree_util.tree_map(lambda x: x[:-1], env_state),
     )
 
 
@@ -469,6 +475,7 @@ class CRLAuxCARL:
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     carl_lr: float = 3e-4
+    fd_lr: float = 3e-4
     batch_size: int = 256
 
     # gamma
@@ -493,12 +500,12 @@ class CRLAuxCARL:
     repr_dim: int = 64
     carl_repr_dim: int = 64
     carl_subgoal_steps: int = 25
-    # Replay-local counterfactual CARL.
-    carl_num_anchors: int = 32
-    carl_num_candidates: int = 32
-    carl_neighbor_pool_size: int = 128
-    carl_num_positives: int = 8
-    carl_num_negatives: int = 8
+    # Dynamics-scored CARL pair mining. Candidate 0 is always the real replay
+    # action; the remaining candidates are sampled from other replay rows.
+    carl_num_candidates: int = 16
+    carl_num_positives: int = 4
+    carl_num_negatives: int = 4
+    carl_candidate_noise_scale: float = 0.05
 
     # layer norm
     use_ln: bool = False
@@ -528,14 +535,11 @@ class CRLAuxCARL:
         assert config.num_envs * (config.episode_length - 1) % self.batch_size == 0, (
             "num_envs * (episode_length - 1) must be divisible by batch_size"
         )
-        assert self.carl_num_anchors > 0
         assert self.carl_num_candidates > 1
-        assert self.carl_neighbor_pool_size >= self.carl_num_candidates - 1
         assert 1 <= self.carl_num_positives < self.carl_num_candidates
         assert 1 <= self.carl_num_negatives <= (
             self.carl_num_candidates - self.carl_num_positives
         )
-        assert self.carl_num_anchors <= config.num_envs * (self.unroll_length - 1)
 
     def train_fn(
         self,
@@ -548,8 +552,8 @@ class CRLAuxCARL:
         progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
     ):
         self.check_config(config)
-        logging.info("CRL replay-local counterfactual CARL planner_mode: %s", self.planner_mode)
-        logging.info("CRL low actor input: [state, CARL phi(state, goal)]")
+        logging.info("CRL auxiliary CARL planner_mode: %s", self.planner_mode)
+        logging.info("CRL low actor input: [state, goal, CARL phi(state, goal)]")
         logging.info("CRL auxiliary CARL state coverage: %s", self.log_state_coverage)
         logging.info(
             "CRL auxiliary CARL representation diagnostics: %s",
@@ -601,7 +605,18 @@ class CRLAuxCARL:
         random.seed(config.seed)
         np.random.seed(config.seed)
         key = jax.random.PRNGKey(config.seed)
-        key, buffer_key, eval_env_key, env_key, actor_key, sa_key, g_key, sg_key, a_key = jax.random.split(key, 9)
+        (
+            key,
+            buffer_key,
+            eval_env_key,
+            env_key,
+            actor_key,
+            sa_key,
+            g_key,
+            sg_key,
+            a_key,
+            fd_key,
+        ) = jax.random.split(key, 10)
 
         env_keys = jax.random.split(env_key, config.num_envs)
         env_state = jax.jit(train_env.reset)(env_keys)
@@ -698,7 +713,8 @@ class CRLAuxCARL:
         )
 
         # CARL learns a state-goal/action-sequence reachability representation.
-        # The actor consumes the state-goal representation but does not backpropagate into either CARL encoder.
+        # The actor consumes the state-goal representation but does not backpropagate
+        # into either CARL encoder.
         sg_encoder = Encoder(
             repr_dim=self.carl_repr_dim,
             network_width=self.h_dim,
@@ -724,15 +740,31 @@ class CRLAuxCARL:
             tx=optax.adam(learning_rate=self.carl_lr),
         )
 
+        forward_dynamics = ForwardDynamics(
+            goal_size=goal_size,
+            network_width=self.h_dim,
+            network_depth=self.n_hidden,
+            use_relu=self.use_relu,
+        )
+        fd_state = TrainState.create(
+            apply_fn=forward_dynamics.apply,
+            params=forward_dynamics.init(
+                fd_key,
+                np.ones([1, state_size]),
+                np.ones([1, self.carl_subgoal_steps * action_size]),
+            ),
+            tx=optax.adam(learning_rate=self.fd_lr),
+        )
+
         # Trainstate
         training_state = TrainingState(
             env_steps=jnp.zeros(()),
-            carl_env_steps=jnp.zeros(()),
             gradient_steps=jnp.zeros(()),
             actor_state=actor_state,
             critic_state=critic_state,
             alpha_state=alpha_state,
             carl_state=carl_state,
+            fd_state=fd_state,
         )
 
         # Replay Buffer
@@ -769,7 +801,7 @@ class CRLAuxCARL:
         buffer_state = jax.jit(replay_buffer.init)(buffer_key)
 
         def _planned_actor_observation(raw_obs, sg_encoder_params):
-            """Builds [state, phi_CARL(state, local goal)] for the flat actor.
+            """Builds [state, local goal, phi_CARL(state, local goal)] for the flat actor.
 
             With ``planner_mode='ant_xy_oracle'`` the local goal is the oracle
             XY waypoint.  There is no high actor in this CRL + CARL-aux agent,
@@ -826,85 +858,11 @@ class CRLAuxCARL:
             )
 
         @jax.jit
-        def collect_replay_carl_pairs(raw_transitions, rollout_data, rollout_env_states, key):
-            pool = jax.vmap(extract_carl_replay_windows, in_axes=(None, 0))(
-                (state_size, _goal_indices_tuple, self.carl_subgoal_steps), raw_transitions
-            )
-            pool = jax.tree_util.tree_map(lambda x: x.reshape((-1,) + x.shape[2:]), pool)
-
-            anchor_data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), rollout_data)
-            anchor_env_states = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), rollout_env_states)
-            anchors = jax.vmap(extract_carl_anchor_windows, in_axes=(None, 0, 0))(
-                (state_size, _goal_indices_tuple, self.carl_subgoal_steps), anchor_data, anchor_env_states
-            )
-            anchors = jax.tree_util.tree_map(lambda x: x.reshape((-1,) + x.shape[2:]), anchors)
-
-            pool_size = pool.state.shape[0]
-            num_anchors = self.carl_num_anchors
-            num_candidates = self.carl_num_candidates
-            neighbor_pool_size = min(self.carl_neighbor_pool_size, pool_size)
-
-            key, anchor_key, candidate_key = jax.random.split(key, 3)
-            anchor_score = jnp.where(anchors.valid, jax.random.uniform(anchor_key, anchors.valid.shape), -jnp.inf)
-            anchor_indices = jnp.argsort(-anchor_score)[:num_anchors]
-
-            anchor_state = anchors.state[anchor_indices]
-            anchor_goal = anchors.goal[anchor_indices]
-            anchor_action = anchors.action_sequence[anchor_indices]
-            anchor_valid = anchors.valid[anchor_indices]
-            anchor_env_state = jax.tree_util.tree_map(lambda x: x[anchor_indices], anchors.env_state)
-
-            valid = pool.valid.astype(pool.state.dtype)
-            count = jnp.maximum(valid.sum(), 1.0)
-            mean = (pool.state * valid[:, None]).sum(0) / count
-            var = ((pool.state - mean) ** 2 * valid[:, None]).sum(0) / count
-            normalized_pool = (pool.state - mean) / jnp.sqrt(var + 1e-6)
-            normalized_anchor = (anchor_state - mean) / jnp.sqrt(var + 1e-6)
-
-            state_distance = jnp.linalg.norm(normalized_anchor[:, None, :] - normalized_pool[None, :, :], axis=-1)
-            state_distance = jnp.where(pool.valid[None, :], state_distance, jnp.inf)
-            local_indices = jnp.argsort(state_distance, axis=1)[:, :neighbor_pool_size]
-            local_valid = jnp.isfinite(jnp.take_along_axis(state_distance, local_indices, axis=1))
-
-            random_score = jnp.where(local_valid, jax.random.uniform(candidate_key, local_valid.shape), -jnp.inf)
-            local_choice = jnp.argsort(-random_score, axis=1)[:, : num_candidates - 1]
-            candidate_indices = jnp.take_along_axis(local_indices, local_choice, axis=1)
-            candidate_valid = jnp.take_along_axis(local_valid, local_choice, axis=1)
-
-            replay_actions = pool.action_sequence[candidate_indices]
-            candidate_actions = jnp.concatenate([anchor_action[:, None], replay_actions], axis=1)
-            candidate_valid = jnp.concatenate([anchor_valid[:, None], candidate_valid], axis=1)
-
-            branch_state = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x[None], (num_candidates,) + x.shape), anchor_env_state)
-            branch_valid = candidate_valid.T
-            actions_by_time = candidate_actions.transpose(2, 1, 0, 3)
-
-            def execute_step(carry, actions):
-                branch_state, branch_valid = carry
-                branch_state = jax.vmap(train_env.step)(branch_state, actions)
-                branch_valid = branch_valid & (branch_state.done < 0.5)
-                return (branch_state, branch_valid), None
-
-            (branch_state, branch_valid), _ = jax.lax.scan(execute_step, (branch_state, branch_valid), actions_by_time)
-            achieved_goals = jnp.take(branch_state.obs[..., :state_size], _goal_indices_arr, axis=-1).transpose(1, 0, 2)
-
-            return build_environment_carl_pairs(
-                anchor_state,
-                anchor_goal,
-                candidate_actions.reshape((num_anchors, num_candidates, -1)),
-                achieved_goals,
-                branch_valid.T,
-                self.carl_num_positives,
-                self.carl_num_negatives,
-            )
-
-        @jax.jit
         def get_experience(actor_state, carl_state, env_state, buffer_state, key):
             @jax.jit
             def f(carry, unused_t):
                 env_state, current_key = carry
                 current_key, next_key = jax.random.split(current_key)
-                start_env_state = env_state
                 env_state, transition = actor_step(
                     actor_state,
                     carl_state,
@@ -913,9 +871,9 @@ class CRLAuxCARL:
                     current_key,
                     extra_fields=("truncation", "traj_id"),
                 )
-                return (env_state, next_key), (transition, start_env_state)
+                return (env_state, next_key), transition
 
-            (env_state, _), (data, rollout_env_states) = jax.lax.scan(
+            (env_state, _), data = jax.lax.scan(
                 f,
                 (env_state, key),
                 (),
@@ -923,7 +881,7 @@ class CRLAuxCARL:
             )
 
             buffer_state = replay_buffer.insert(buffer_state, data)
-            return env_state, buffer_state, data, rollout_env_states
+            return env_state, buffer_state
 
         def prefill_replay_buffer(training_state, env_state, buffer_state, key):
             @jax.jit
@@ -931,7 +889,7 @@ class CRLAuxCARL:
                 del unused
                 training_state, env_state, buffer_state, key = carry
                 key, new_key = jax.random.split(key)
-                env_state, buffer_state, _, _ = get_experience(
+                env_state, buffer_state = get_experience(
                     training_state.actor_state,
                     training_state.carl_state,
                     env_state,
@@ -972,26 +930,50 @@ class CRLAuxCARL:
                 g_encoder=g_encoder,
                 sg_encoder=sg_encoder,
                 a_encoder=a_encoder,
+                forward_dynamics=forward_dynamics,
             )
 
-            # Control learning is unchanged. The actor consumes CARL features,
-            # but actor gradients still do not update the CARL encoder.
+            # 1) Learn the local K-step forward dynamics from real replay tuples.
+            training_state, fd_metrics = update_forward_dynamics(
+                context, networks, transitions, training_state
+            )
+
+            # 2) For each (s, g), score several candidate action sequences by
+            #    how close F(s, A) predicts they get to g. Closest candidates
+            #    become CARL positives; farthest candidates become negatives.
+            key, pair_key = jax.random.split(key)
+            carl_pairs = create_carl_pairs(
+                forward_dynamics,
+                training_state.fd_state.params,
+                transitions,
+                pair_key,
+                self.carl_num_candidates,
+                self.carl_num_positives,
+                self.carl_num_negatives,
+                self.carl_candidate_noise_scale,
+            )
+            training_state, carl_metrics = update_carl_aux(
+                context, networks, carl_pairs, training_state
+            )
+
+            # 3) The actor consumes CARL features, but actor gradients do not
+            #    update the CARL encoder.
             training_state, actor_metrics = update_actor_and_alpha(
                 context, networks, transitions, training_state, actor_key
             )
             training_state, critic_metrics = update_critic(
                 context, networks, transitions, training_state, critic_key
             )
-            training_state = training_state.replace(
-                gradient_steps=training_state.gradient_steps + 1
-            )
+            training_state = training_state.replace(gradient_steps=training_state.gradient_steps + 1)
 
             metrics = {}
             metrics.update(actor_metrics)
             metrics.update(critic_metrics)
+            metrics.update(carl_metrics)
+            metrics.update(fd_metrics)
             if _use_planner:
                 state = transitions.extras["state"]
-                local_goal = transitions.extras["local_goal"]
+                local_goal = transitions.observation[:, state_size:]
                 current_goal_state = state[:, _goal_indices_arr]
                 metrics["planner/training_local_goal_distance"] = jnp.mean(
                     jnp.linalg.norm(local_goal - current_goal_state, axis=-1)
@@ -1017,7 +999,12 @@ class CRLAuxCARL:
                 raw_transitions.observation.shape[0],
             )
             batches = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
-                (self.discounting, state_size,  _goal_indices_tuple, self.carl_subgoal_steps),
+                (
+                    self.discounting,
+                    state_size,
+                    _goal_indices_tuple,
+                    self.carl_subgoal_steps,
+                ),
                 raw_transitions,
                 batch_keys,
             )
@@ -1085,38 +1072,26 @@ class CRLAuxCARL:
 
         @jax.jit
         def training_step(training_state, env_state, buffer_state, key):
-            experience_key1, experience_key2, sampling_key, training_key, carl_key = jax.random.split(key, 5)
+            experience_key1, experience_key2, sampling_key, training_key = jax.random.split(key, 4)
 
-            # Normal PCRL collection.
-            env_state, buffer_state, rollout_data, rollout_env_states = get_experience(
+            # update buffer
+            env_state, buffer_state = get_experience(
                 training_state.actor_state,
                 training_state.carl_state,
                 env_state,
                 buffer_state,
                 experience_key1,
             )
+
             training_state = training_state.replace(
                 env_steps=training_state.env_steps + env_steps_per_actor_step,
             )
 
-            # Same replay sample is used for PCRL and CARL.
-            buffer_state, raw_transitions = replay_buffer.sample(buffer_state)
+            # sample actor-step worth of transitions
+            buffer_state, transitions = replay_buffer.sample(buffer_state)
 
-            # Build environment-verified CARL pairs from nearby replay states.
-            carl_pairs = collect_replay_carl_pairs(raw_transitions, rollout_data, rollout_env_states, carl_key)
-            counterfactual_env_steps = self.carl_num_anchors * self.carl_num_candidates * self.carl_subgoal_steps
-            training_state = training_state.replace(
-                carl_env_steps=(
-                    training_state.carl_env_steps
-                    + counterfactual_env_steps
-                )
-            )
-
-            # PCRL update.
-            batch_keys = jax.random.split(
-                sampling_key,
-                raw_transitions.observation.shape[0],
-            )
+            # process transitions for training
+            batch_keys = jax.random.split(sampling_key, transitions.observation.shape[0])
             transitions = jax.vmap(flatten_batch, in_axes=(None, 0, 0))(
                 (
                     self.discounting,
@@ -1124,64 +1099,35 @@ class CRLAuxCARL:
                     tuple(np.asarray(train_env.goal_indices)),
                     self.carl_subgoal_steps,
                 ),
-                raw_transitions,
+                transitions,
                 batch_keys,
             )
             transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(
-                    x,
-                    (-1,) + x.shape[2:],
-                    order="F",
-                ),
-                transitions,
+                lambda x: jnp.reshape(x, (-1,) + x.shape[2:], order="F"), transitions
             )
 
-            permutation = jax.random.permutation(
-                experience_key2,
-                len(transitions.observation),
-            )
+            # permute transitions
+            permutation = jax.random.permutation(experience_key2, len(transitions.observation))
+            transitions = jax.tree_util.tree_map(lambda x: x[permutation], transitions)
             transitions = jax.tree_util.tree_map(
-                lambda x: x[permutation],
+                lambda x: jnp.reshape(x, (-1, self.batch_size) + x.shape[1:]),
                 transitions,
             )
-            transitions = jax.tree_util.tree_map(
-                lambda x: jnp.reshape(
-                    x,
-                    (-1, self.batch_size) + x.shape[1:],
+
+            # take actor-step worth of training-step
+            (
+                (
+                    training_state,
+                    _,
                 ),
-                transitions,
-            )
+                metrics,
+            ) = jax.lax.scan(update_networks, (training_state, training_key), transitions)
 
-            ((training_state, _), metrics) = jax.lax.scan(
-                update_networks,
-                (training_state, training_key),
-                transitions,
-            )
-
-            # CARL update.
-            context = dict(
-                **vars(self),
-                **vars(config),
-                state_size=state_size,
-                action_size=action_size,
-                goal_size=goal_size,
-                obs_size=obs_size,
-                goal_indices=train_env.goal_indices,
-                target_entropy=target_entropy,
-            )
-            networks = dict(
-                sg_encoder=sg_encoder,
-                a_encoder=a_encoder,
-            )
-            training_state, carl_metrics = update_carl_aux(
-                context,
-                networks,
-                carl_pairs,
+            return (
                 training_state,
-            )
-            metrics.update(carl_metrics)
-
-            return (training_state, env_state, buffer_state), metrics
+                env_state,
+                buffer_state,
+            ), metrics
 
         @jax.jit
         def training_epoch(
@@ -1285,6 +1231,7 @@ class CRLAuxCARL:
                 training_state.actor_state.params,
                 training_state.critic_state.params,
                 training_state.carl_state.params,
+                training_state.fd_state.params,
             )
 
             if self.log_representation_space and do_render:
